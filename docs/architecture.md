@@ -6,7 +6,56 @@ This document details the systems architecture, lifecycle orchestration, and dat
 
 ## Architecture Topology
 
-The platform coordinates infrastructure provisioning, system daemon initialization, workload execution, and telemetry scrape streams across distinct layers:
+The platform coordinates infrastructure provisioning, system daemon initialization, workload execution, and telemetry scrape streams across four distinct architectural zones:
+
+```mermaid
+flowchart TB
+    subgraph InfraZone ["1. Infrastructure Layer (Terraform)"]
+        VPC[AWS VPC Network] --> EKS[Amazon EKS Cluster]
+    end
+
+    subgraph PlatformZone ["2. Platform Control Layer (Helm / Argo CD)"]
+        Karpenter[Karpenter Autoscaler]
+        ArgoCD[Argo CD GitOps Engine]
+        EKS --> Karpenter
+        EKS --> ArgoCD
+    end
+
+    subgraph RuntimeZone ["3. Hardware Runtime Layer (NVIDIA Operator)"]
+        GPUOp[NVIDIA GPU Operator]
+        Driver[Kernel Drivers]
+        Toolkit[NVIDIA Container Toolkit]
+        DevPlugin[NVIDIA Device Plugin]
+        TimeSlicing[GPU Time-Slicing Config]
+        CUDA[CUDA Matrix Workload]
+
+        Karpenter -->|Provisions Node| GPUOp
+        GPUOp --> Driver
+        Driver --> Toolkit
+        Toolkit --> DevPlugin
+        DevPlugin --> TimeSlicing
+        TimeSlicing --> CUDA
+    end
+
+    subgraph ObsZone ["4. Observability Stack (DCGM / Prometheus)"]
+        DCGM[NVIDIA DCGM Exporter]
+        Prometheus[Prometheus Metrics Engine]
+        Grafana[Grafana Dashboard]
+
+        CUDA --> DCGM
+        DCGM --> Prometheus
+        Prometheus --> Grafana
+    end
+
+    style InfraZone fill:#2a3a5c,stroke:#fff,stroke-width:1px,color:#fff
+    style PlatformZone fill:#3a4b6c,stroke:#fff,stroke-width:1px,color:#fff
+    style RuntimeZone fill:#1e4c3a,stroke:#fff,stroke-width:1px,color:#fff
+    style ObsZone fill:#4c2c2c,stroke:#fff,stroke-width:1px,color:#fff
+```
+
+### Runtime Bootstrapping Sequence
+
+The diagram below details the sequence of node scaling, hardware discovery, dynamic operator driver loading, and service registration:
 
 ```mermaid
 sequenceDiagram
@@ -43,6 +92,9 @@ Unlike legacy Kubernetes Cluster Autoscaler (which scales AWS Auto Scaling Group
 *   **Mechanics:** It intercepts pending pods, evaluates their CPU, Memory, NodeSelector, and Toleration requirements, and calls the AWS EC2 fleet APIs directly to provision the exact instance size and capacity type (Spot vs On-Demand) required.
 *   **GPU Optimizations:** Configured via `EC2NodeClass` and `NodePool` to target GPU-specific instances (e.g. G4dn, G6 families). It dynamically discovers EKS-optimized AMIs with pre-installed kernel configurations and injects custom taints (`nvidia.com/gpu=true:NoSchedule`) to isolate these expensive machines from regular CPU workloads.
 
+> [!NOTE] Production Note: Karpenter Provisioning Timing
+> Karpenter provisions compute instances and registers them as ready nodes *before* GPU resource capacities are advertised by Kubelet. GPU resource capacity availability only appears in Node Status once the GPU Operator completes driver builds and boots the Device Plugin.
+
 ### 2. Node Feature Discovery (NFD)
 *   **Role:** NFD is a Kubernetes controller that runs as a DaemonSet to detect hardware features on the underlying cluster nodes (e.g., CPU features, PCI devices, system properties) and automatically publishes them as node labels.
 *   **GPU Interaction:** NFD identifies the presence of physical NVIDIA PCI hardware IDs and writes labels such as `feature.node.kubernetes.io/pci-10de.present=true`. These labels act as the execution trigger for the NVIDIA GPU Operator.
@@ -63,6 +115,9 @@ Unlike legacy Kubernetes Cluster Autoscaler (which scales AWS Auto Scaling Group
 ### 5. GPU Time-Slicing
 *   **Mechanism:** A system-level partitioning mode that virtualization-enables a physical GPU. It configures the NVIDIA Device Plugin to replicate a single physical GPU device into multiple virtual devices (e.g., exposing 1 physical A10G as 4 virtual devices).
 *   **Limitations:** Unlike MIG (Multi-Instance GPU), Time-Slicing does not provide hardware-level memory or compute isolation. Workloads share the same memory space (VRAM) and execution queues. If one container runs out of VRAM or executes a run-away kernel, it can impact or crash concurrent workloads sharing that GPU.
+
+> [!NOTE] Production Note: Sharing Model Risks
+> Time-Slicing is appropriate for low-tier services or inference hosting but is unsuitable for large-scale distributed training due to scheduling latency penalties. Because VRAM is shared with no hardware limits, memory leaks in one container will cause Out-of-Memory (OOM) failures in all other pods sharing that device. Multi-Instance GPU (MIG) should be deployed when hardware-level memory and compute isolation are required.
 
 ### 6. NVIDIA Container Toolkit & CUDA Runtime
 *   **NVIDIA Container Toolkit:** Operates at the runtime interface layer (OCI). It intercepts container creation requests. When a container specifies `NVIDIA_VISIBLE_DEVICES`, the toolkit injects the GPU libraries and binaries (e.g., `libcuda.so`) from the host into the container's environment.

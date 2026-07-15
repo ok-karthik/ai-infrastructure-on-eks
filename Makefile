@@ -1,5 +1,5 @@
 # ==============================================================================
-# Makefile for GPU Platform on EKS
+# Makefile for AI Infrastructure Platform on Amazon EKS
 # ==============================================================================
 # Automates Terraform execution, manages Kubernetes configurations, and coordinates
 # multi-layer GPU infrastructure deployment.

@@ -1,6 +1,6 @@
 # Engineering Journal: Post-Mortems & Lessons Learned
 
-This journal documents the actual troubleshooting sessions, post-mortems, and engineering insights gained during the development and optimization of the EKS GPU platform.
+This journal documents the actual troubleshooting sessions, post-mortems, and engineering insights gained during the development and optimization of the AI Infrastructure Platform on Amazon EKS.
 
 ---
 

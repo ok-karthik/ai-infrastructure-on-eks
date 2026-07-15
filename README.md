@@ -1,4 +1,4 @@
-# GPU Platform on Amazon EKS: AI Infrastructure Blueprint
+# AI Infrastructure Platform on Amazon EKS
 
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-v1.30-blue.svg?logo=kubernetes&style=flat-square)](https://kubernetes.io/)
 [![Terraform](https://img.shields.io/badge/Terraform-v1.8+-purple.svg?logo=terraform&style=flat-square)](https://www.terraform.io/)
@@ -6,152 +6,162 @@
 [![Karpenter](https://img.shields.io/badge/Karpenter-v1.13-orange.svg?style=flat-square)](https://karpenter.sh/)
 [![GitOps](https://img.shields.io/badge/GitOps-Argo%20CD-red.svg?logo=argo&style=flat-square)](https://argoproj.github.io/argo-cd/)
 
-A production-grade, GitOps-driven Kubernetes platform architecture tailored for the provisioning, scaling, and observability of NVIDIA GPU workloads on Amazon EKS. This repository showcases real-world platform engineering patterns to dynamically manage heterogeneous GPU hardware, partition compute resources via Time Slicing, execute CUDA validation suites, and expose low-level hardware telemetry.
+A production-ready blueprint for an GPU-optimized Kubernetes platform on AWS, designed for scaling, partitioning, and observing NVIDIA GPU workloads. It implements dynamic compute provisioning, GPU Time-Slicing virtualization, and hardware observability.
 
 ---
 
-## Architecture Flow
+## Architecture Topology
 
-The platform is designed in a layered architecture, starting from bare AWS infrastructure and flowing down to user-facing ML workloads and observability dashboards:
+The platform separates responsibilities into four distinct layers (Infrastructure, Platform, Runtime, and Observability):
 
 ```mermaid
-graph TD
-    AWS[AWS Cloud Infrastructure]
-    EKS[Amazon EKS Cluster]
-    Karpenter[Karpenter Autoscaler]
-    GPUNodes[Dynamic GPU Nodes Spot EC2]
-    GPUOp[NVIDIA GPU Operator]
-    DevPlugin[NVIDIA Device Plugin]
-    TimeSlicing[GPU Time Slicing / Partitioning]
-    CUDA[CUDA Workloads]
-    DCGM[DCGM Exporter DaemonSet]
-    Prometheus[Prometheus Metrics Engine]
-    Grafana[Grafana Dashboards]
+flowchart TD
+    subgraph Infrastructure ["1. Infrastructure Layer (Terraform)"]
+        AWS[AWS VPC Network] --> EKS[Amazon EKS Cluster]
+    end
 
-    AWS --> EKS
-    EKS --> Karpenter
-    Karpenter --> GPUNodes
-    GPUNodes --> GPUOp
-    GPUOp --> DevPlugin
-    DevPlugin --> TimeSlicing
-    TimeSlicing --> CUDA
-    CUDA --> DCGM
-    DCGM --> Prometheus
-    Prometheus --> Grafana
+    subgraph Platform ["2. Platform Control Layer (Helm / Argo CD)"]
+        Karpenter[Karpenter Autoscaler]
+        ArgoCD[Argo CD GitOps Engine]
+        EKS --> Karpenter
+        EKS --> ArgoCD
+    end
+
+    subgraph Runtime ["3. Hardware Runtime Layer (NVIDIA Operator)"]
+        GPUOp[NVIDIA GPU Operator]
+        Driver[Kernel Drivers]
+        Toolkit[NVIDIA Container Toolkit]
+        DevPlugin[NVIDIA Device Plugin]
+        TimeSlicing[GPU Time-Slicing Config]
+        CUDA[CUDA Matrix Workload]
+
+        Karpenter -->|Provisions Node| GPUOp
+        GPUOp --> Driver
+        Driver --> Toolkit
+        Toolkit --> DevPlugin
+        DevPlugin --> TimeSlicing
+        TimeSlicing --> CUDA
+    end
+
+    subgraph Observability ["4. Observability Stack (DCGM / Prom)"]
+        DCGM[NVIDIA DCGM Exporter]
+        Prometheus[Prometheus Metrics Engine]
+        Grafana[Grafana Dashboard]
+
+        CUDA --> DCGM
+        DCGM --> Prometheus
+        Prometheus --> Grafana
+    end
+
+    style Infrastructure fill:#2a3a5c,stroke:#fff,stroke-width:1px,color:#fff
+    style Platform fill:#3a4b6c,stroke:#fff,stroke-width:1px,color:#fff
+    style Runtime fill:#1e4c3a,stroke:#fff,stroke-width:1px,color:#fff
+    style Observability fill:#4c2c2c,stroke:#fff,stroke-width:1px,color:#fff
 ```
 
-For a deep dive into the runtime bootstrap process and communication flow between these components, see [docs/architecture.md](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/architecture.md).
+*For detailed component relationships and structural breakdowns, see [docs/architecture.md](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/architecture.md).*
 
 ---
 
-## Key Features
+## Core Features
 
-*   **Dynamic GPU Node Provisioning:** Leverages Karpenter to spin up specialized AWS EC2 GPU instances (`g4dn.xlarge`, `g4dn.2xlarge`, `g6.xlarge`) on-demand based on workload requests, automatically selecting cost-efficient Spot capacity and enforcing hard resource bounds.
-*   **Automated GPU Lifecycle Management:** Deploys the NVIDIA GPU Operator to boot and supervise the driver kernel modules, container toolkit, device plugin, and validators automatically on newly provisioned GPU nodes.
-*   **Resource Partitioning (GPU Time-Slicing):** Implements system-level GPU virtualization to advertise multiple virtual GPU devices per physical GPU, allowing small inference or utility workloads to share physical VRAM and compute safely.
-*   **Hardware Observability & Telemetry:** Runs NVIDIA DCGM (Data Center GPU Manager) Exporter to extract low-level metrics (VRAM usage, SM clock speed, temperature, PCIe throughput, energy consumption) and scrapes them into a local Prometheus/Grafana stack.
-*   **GitOps-Driven Configuration Management:** Employs Argo CD to manage the state of cluster components (Karpenter NodePools, EC2NodeClasses, Prometheus deployments, and application manifests) directly from the repository.
+*   **Dynamic Autoscaling:** I configured Karpenter NodePools to match GPU-specific resource demands (`nvidia.com/gpu`), scaling out spot compute instances (`g4dn`, `g6` families) to minimize execution costs.
+*   **Automated GPU Lifecycle:** Instantiated the NVIDIA GPU Operator to load kernel modules, configure the container runtime hook, and execute CUDA validators.
+*   **Virtual GPU Partitioning:** Implemented GPU Time-Slicing to divide physical GPUs into multiple virtual slices, enabling smaller workloads to share resources.
+*   **Observability Pipeline:** Integrated NVIDIA DCGM Exporter with Prometheus and Grafana, capturing real-time SM execution and core temperatures.
 
 ---
 
-## Directory Layout
+## Repository Structure
 
 ```text
-gpu-platform-on-eks/
-├── README.md                  # Project overview, layout, and portfolio features
-├── Makefile                   # Automation entrypoint for Terraform and Kubernetes configurations
-├── AGENTS.md                  # Development constraints and workflow guidelines
-├── 01-infrastructure/         # Terraform configurations for VPC network and EKS control plane
-│   ├── 01-network/            # Base VPC, public/private subnets, NAT Gateway
-│   ├── 02-eks/                # EKS cluster, node groups, IAM roles, and Karpenter credentials
-│   ├── main.tf                # Infrastructure orchestration
-│   ├── providers.tf           # Terraform AWS and Helm provider configuration
-│   └── variables.tf           # Infrastructure variables
-├── 02-platform/               # Kubernetes platform controllers and custom resource configurations
-│   ├── argocd/                # Deployed Helm configurations for Argo CD
-│   ├── karpenter/             # NodePool and EC2NodeClass YAML specifications
-│   ├── monitoring/            # Prometheus and Grafana service and deployment YAMLs
-│   ├── main.tf                # Terraform orchestrations for platform controllers (Helm releases)
-│   └── variables.tf           # Platform variable declarations
-├── 03-workloads/              # CUDA and CPU verification workloads
-│   ├── cpu-test-deployment.yaml
-│   ├── gpu-test-deployment.yaml
-│   ├── gpu-test-pod-workloads.yaml
-│   └── argocd-app.yaml        # Argo CD application configuration
-├── docs/                      # Technical documentation and guides
-│   ├── architecture.md        # Technical component relationships and diagrams
-│   ├── troubleshooting.md     # Production troubleshooting runbook
-│   ├── hands-on-labs.md       # 15 step-by-step platform execution labs
-│   └── interview-notes/       # Conceptual deep dives on GPU systems architecture
-│       ├── device-plugin.md   # Kubelet device plugin contract (ListAndWatch/Allocate)
-│       ├── gpu-operator.md    # GPU Operator components and ClusterPolicy
-│       ├── time-slicing.md    # GPU virtualization (Time-Slicing, MIG, MPS)
-│       ├── dcgm.md            # Hardware metrics collection and exporter mechanics
-│       └── karpenter.md       # Karpenter scheduling, Spot provisioning, and disruption
-└── archive/                   # Deprecated resources and scratch configurations
+ai-infrastructure-on-eks/
+├── 01-infrastructure/      # Terraform modules: VPC, subnets, EKS, and IAM OIDC roles
+├── 02-platform/            # Platform bootstraps: Argo CD, Karpenter pools, monitoring
+├── 03-workloads/           # CUDA execution validation deployments & GitOps manifests
+├── docs/                   # Guides, runbooks, and deep-dive conceptual notes
+│   ├── labs/               # 6 logical platform engineering hands-on labs
+│   ├── interview-notes/    # Conceptual systems design interview guides
+│   ├── architecture.md     # Sequence interactions & dependency flows
+│   ├── troubleshooting.md  # Production troubleshooting runbook
+│   ├── lessons-learned.md  # Engineering debugging journal & post-mortems
+│   ├── performance.md      # GPU performance, metrics, and latency observations
+│   └── roadmap.md          # Future enhancements (MIG, vLLM, Ray, Distributed Training)
+└── Makefile                # Operations entrypoint for TF and Kubernetes automation
 ```
 
 ---
 
-## Core Technologies
+## Deployment & Demo Workflow
 
-| Domain | Tools / Technologies |
-|---|---|
-| **Cloud Infrastructure** | AWS, VPC, IAM, EKS, KMS |
-| **Infrastructure as Code** | Terraform, Make |
-| **Compute Scheduling** | Kubernetes Scheduler, Karpenter Autoscaler |
-| **GPU Execution Environment** | NVIDIA GPU Operator, Container Toolkit, CUDA |
-| **GPU Scheduling & Sharing** | NVIDIA Device Plugin, GPU Time Slicing (Shared VRAM) |
-| **Metrics & Observability** | NVIDIA DCGM Exporter, Prometheus, Grafana |
-| **Configuration Delivery** | Argo CD (GitOps Core) |
+I verified the entire bootstrap and execution workflow using the following progressive stages:
 
----
-
-## Deployment Workflow
-
-```text
-Step 1: Terraform Init & Plan   --> Executes tf validations inside 01-infrastructure/
-Step 2: VPC Network Provision   --> Deploys highly-secure private subnets and NAT Gateways
-Step 3: EKS Cluster Setup       --> Boots EKS control plane and initial system Node Group (T3 instances)
-Step 4: Platform Bootstrap      --> Terraform installs Helm releases for Argo CD and Karpenter
-Step 5: NodePool Configuration  --> Applies Karpenter NodePools to define target GPU EC2 Spot families
-Step 6: Workload Deployment     --> Workloads target GPU resources, triggering Karpenter scale-up
-Step 7: Operator Initialization --> GPU Operator configures newly booted nodes (Drivers, Device Plugin)
-Step 8: Metric Collection       --> DCGM Exporter scrapes GPU stats; Grafana visualizes load
-```
-
----
-
-## Learning Outcomes
-
-*   **Kubernetes Device Plugin Interface:** Mastered the structural contract between `kubelet` and the NVIDIA Device Plugin. Visualized how `Register()`, `ListAndWatch()`, and `Allocate()` lifecycle calls control resource tracking and container mounting.
-*   **Kubelet Device Manager Internals:** Understood how Kubelet manages the host `/dev` socket, assigns local device paths, and configures container runtimes (NVIDIA Container Runtime) dynamically.
-*   **Heterogeneous GPU Scheduling:** Configured Karpenter NodePools to match workloads requesting `nvidia.com/gpu` resources, targeting proper node taints and tolerations to isolate expensive compute.
-*   **GPU Virtualization Tradeoffs:** Investigated multi-tenant GPU sharing strategies including GPU Time-Slicing, Multi-Instance GPU (MIG), and Multi-Process Service (MPS).
-*   **Hardware Observability at Scale:** Configured Prometheus scrape jobs for the DCGM Exporter daemonset. Built custom Grafana dashboards focusing on critical infrastructure KPIs (e.g., SM occupancy, VRAM saturation, throttle reasons).
+1.  **Infrastructure Initialization:**
+    ```bash
+    make init && make validate
+    ```
+2.  **Cluster Provisioning:**
+    ```bash
+    make apply
+    ```
+3.  **Dynamic Scale-up Verification:**
+    I scheduled a pending GPU job to trigger Karpenter node provisioning:
+    ```bash
+    kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
+    ```
+4.  **Operator Lifecycle Check:**
+    I verified the GPU Operator successfully loads driver layers:
+    ```bash
+    kubectl get pods -n gpu-operator -w
+    ```
+5.  **CUDA Computation Validation:**
+    I verified core hardware execution:
+    ```bash
+    kubectl apply -f 03-workloads/gpu-test-deployment.yaml
+    ```
+6.  **Scrape Verification:**
+    I queried metrics from the scrape engine:
+    ```bash
+    kubectl exec -n gpu-operator ds/nvidia-dcgm-exporter -- curl -s localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL
+    ```
 
 ---
 
-## Production Scenarios & Outages Investigated
+## Screenshots
 
-This repository houses troubleshooting configurations representing real production failure modes encountered during cluster scaling and operator upgrades:
+The following visual checkpoints demonstrate the verified state of the platform:
 
-*   **NVIDIA Device Plugin CrashLoopBackOff:** Resolved conflicts where the Device Plugin crashed due to mismatched container runtime configurations or missing host-level driver links.
-*   **Broken ClusterPolicy Reconciliation:** Debugged cases where the GPU Operator failed to reconcile driver or toolkit pods because of restrictive network policies, security context constraints, or missing kernel-headers on the host image.
-*   **Invalid ConfigMap Time-Slicing Disruption:** Solved incidents where incorrect GPU replication keys in the config map caused nodes to advertise zero GPU resources, starving pending workloads.
-*   **GPU Operators Failing to Advertise Capacity:** Investigated Kubelet failing to advertise `nvidia.com/gpu` resources due to Node Feature Discovery (NFD) labels missing from the node object.
-*   **Karpenter Runaway Scaling (Unexpected GPU Nodes):** Fixed scheduling configurations where workloads lacking proper tolerations scheduled on GPU nodes, or workloads requesting GPUs without node selectors forced Karpenter to spin up expensive GPU instances instead of standard CPU instances.
-*   **Node Becoming NotReady under Heavy CUDA Load:** Debugged hardware and driver crashes under high thermal/SM frequency load that triggered kernel panics, placing nodes into a `NotReady` status.
+### 1. Observability Dashboard
+Displays high-resolution SM utility spikes, memory allocations, and thermal states:
+![Grafana Performance Dashboard](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/grafana_gpu_dashboard.png)
 
-Detailed reproduction steps, inspection commands, root cause analyses, and permanent resolutions are cataloged in the [docs/troubleshooting.md](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/troubleshooting.md) runbook.
+### 2. GPU Time-Slicing Architecture
+Conceptual layout illustrating physical-to-virtual GPU resource partitioning:
+![GPU Time-Slicing Architecture Diagram](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/gpu_time_slicing_diagram.png)
+
+### 3. Dynamic Provisioning
+Karpenter controller logs capturing EKS dynamic scale-up requests:
+![Karpenter GPU Node Provisioning Logs](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/karpenter_gpu_provisioning.png)
+
+### 4. GPU Hardware Status
+Device verification output inside container namespaces using `nvidia-smi`:
+![nvidia-smi command-line output](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/nvidia_smi_output.png)
 
 ---
 
-## Future Improvements
+## Engineering Investigations & Outcomes
 
-To expand this platform for LLM fine-tuning and inference pipelines, the following features are planned:
-1.  **Multi-Instance GPU (MIG):** Configure physical A100/H100 partitioning at the hardware level for strict memory and compute isolation.
-2.  **Volcano Scheduling:** Integrate Volcano scheduler for batch processing, gang scheduling, and queue management of distributed ML training runs.
-3.  **Distributed Training Over NCCL:** Configure AWS EFA (Elastic Fabric Adapter) and GPUDirect RDMA inside the Kubernetes network to optimize multi-node training over NCCL.
-4.  **Inference Pipelines (Triton / vLLM):** Deploy serving frameworks (vLLM and Triton Inference Server) managed by KServe for dynamic GPU autoscaling based on concurrent request counts.
-5.  **Ray Cluster on EKS:** Setup KubeRay to manage distributed Python applications on Karpenter-provisioned GPU nodes.
+*   **Validated** Kubelet-to-Device Plugin contracts, tracing `Register()`, `ListAndWatch()`, and `Allocate()` gRPC cycles.
+*   **Investigated** multi-tenant sharing methodologies, evaluating VRAM limits under GPU Time-Slicing, MIG, and MPS.
+*   **Profiled** low-level metrics (`dcgm_sm_copy`, `dcgm_xid_errors`), implementing alert rules for hardware throttling and bus faults.
+*   **Troubleshot** real-world failure patterns including container runtime loops, invalid config mapping boundaries, and Karpenter multi-resource scheduling bottlenecks.
+
+---
+
+## Documentation Registry
+
+To explore specific topics, refer to the following resources:
+*   **Hands-on Labs:** [01: Provisioning](docs/labs/01-gpu-node-provisioning.md) | [02: GPU Operator](docs/labs/02-gpu-operator.md) | [03: Device Plugin](docs/labs/03-device-plugin.md) | [04: Time-Slicing](docs/labs/04-time-slicing.md) | [05: Observability](docs/labs/05-dcgm-observability.md) | [06: Troubleshooting](docs/labs/06-production-troubleshooting.md)
+*   **Systems Architecture Guides:** [Architecture Deep-Dive](docs/architecture.md) | [Performance Profiling](docs/performance.md) | [Future Roadmap](docs/roadmap.md)
+*   **Interview Preparation Notes:** [Device Plugin Interface](docs/interview-notes/device-plugin.md) | [GPU Operator Internals](docs/interview-notes/gpu-operator.md) | [Virtualization Models](docs/interview-notes/time-slicing.md) | [Telemetry Metrics](docs/interview-notes/dcgm.md) | [Karpenter Scheduling](docs/interview-notes/karpenter.md)
+*   **Incident Journal:** [Lessons Learned & Post-Mortems](docs/lessons-learned.md)

@@ -1,6 +1,6 @@
 # Hands-On Infrastructure & Operations Labs
 
-This guide contains 15 sequential hands-on labs designed to validate platform capabilities, troubleshoot complex failure states, and perform chaos engineering experiments on the EKS GPU platform.
+This guide contains 15 sequential hands-on labs designed to validate platform capabilities, troubleshoot complex failure states, and perform chaos engineering experiments on the AI Infrastructure Platform on Amazon EKS.
 
 ---
 
@@ -366,7 +366,7 @@ Automating scrape configurations via ServiceMonitors ensures immediate integrati
 ## Lab 10: Grafana Dashboard
 
 ### Objective
-Deploy Grafana and configure visualization dashboards for the EKS GPU platform.
+Deploy Grafana and configure visualization dashboards for the AI Infrastructure Platform on Amazon EKS.
 
 ### Architecture
 ```text

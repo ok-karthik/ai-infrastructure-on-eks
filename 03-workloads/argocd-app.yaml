@@ -7,7 +7,7 @@ spec:
   project: default
   source:
     # Point to the user's repository target URL when deployed in production
-    repoURL: 'https://github.com/YOUR_GITHUB_USERNAME/gpu-platform-on-eks.git'
+    repoURL: 'https://github.com/YOUR_GITHUB_USERNAME/ai-infrastructure-on-eks.git'
     targetRevision: HEAD
     path: 02-platform/karpenter
   destination:
