@@ -1,0 +1,26 @@
+#apiVersion: apps/v1
+#kind: Deployment
+#metadata:
+#  name: cpu-test-scale
+#  namespace: default
+#spec:
+#  replicas: 3 # Deploy 3 replicas to exceed current cluster capacity
+#  selector:
+#    matchLabels:
+#      app: cpu-test
+#  template:
+#    metadata:
+#      labels:
+#        app: cpu-test
+#    spec:
+#      containers:
+#        - name: pause-container
+#          # Use a lightweight pause image that does nothing but hold resources
+#          image: registry.k8s.io/pause:3.9
+#          resources:
+#            requests:
+#              # Request 800m CPU per pod. Total = 2.4 vCPUs.
+#              # Since system pods already consume CPU on the existing t3.micro nodes,
+#              # this will force Karpenter to launch a new Spot instance.
+#              cpu: 800m
+#              memory: 512Mi

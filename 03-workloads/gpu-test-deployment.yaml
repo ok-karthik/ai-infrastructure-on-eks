@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-test-deployment
+spec:
+  replicas: 4
+
+  selector:
+    matchLabels:
+      app: gpu-test
+
+  template:
+    metadata:
+      labels:
+        app: gpu-test
+
+    spec:
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+      containers:
+      - name: gpu-load-generator
+
+        image: nvidia/cuda:12.2.0-devel-ubuntu22.04
+
+        command:
+        - /bin/bash
+        - -c
+
+        args:
+        - |
+          cat << 'EOF' > load.cu
+          #include <cuda_runtime.h>
+          #include <iostream>
+
+          __global__ void kernel(float *a) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+            if (idx < 1000000) {
+              float x = idx;
+
+              for (int i = 0; i < 100000; i++) {
+                x = x * 1.00001f + 0.00001f;
+              }
+
+              a[idx] = x;
+            }
+          }
+
+          int main() {
+            float *d;
+
+            cudaMalloc(&d, 1000000 * sizeof(float));
+
+            std::cout << "Starting infinite GPU load..." << std::endl;
+
+            while (true) {
+              kernel<<<4096,256>>>(d);
+              cudaDeviceSynchronize();
+            }
+
+            return 0;
+          }
+          EOF
+
+          echo "Compiling..."
+          nvcc load.cu -o load
+
+          echo "Running..."
+          ./load
+
+        resources:
+          limits:
+            nvidia.com/gpu: 1

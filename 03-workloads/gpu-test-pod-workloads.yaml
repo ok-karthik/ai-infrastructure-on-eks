@@ -1,0 +1,25 @@
+#apiVersion: v1
+#kind: Pod
+#metadata:
+#  name: gpu-test-vectoradd
+#  namespace: default
+#spec:
+#  restartPolicy: OnFailure
+#  # 1. Match the taint configured on the Karpenter GPU NodePool
+#  tolerations:
+#    - key: nvidia.com/gpu
+#      operator: Exists
+#      effect: NoSchedule
+#  # 2. Force placement on a GPU node using nodeSelector (matches our NodePool label)
+#  #nodeSelector:
+#  #  node.kubernetes.io/instance-type: g4dn.xlarge
+#  containers:
+#    - name: cuda-sleep
+#      # Use base CUDA image and sleep for 30 minutes (1800 seconds) to allow Karpenter testing
+#      image: nvidia/cuda:12.2.0-base-ubuntu22.04
+#      command: ["/bin/sh", "-c"]
+#      args: ["echo 'Starting GPU test sleep (30 mins)...'; sleep 1800; echo 'Done!'"]
+#      resources:
+#        limits:
+#          # Request exactly 1 GPU
+#          nvidia.com/gpu: 1

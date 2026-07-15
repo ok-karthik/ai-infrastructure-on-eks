@@ -1,0 +1,19 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gpu-platform-bootstrap
+  namespace: argocd
+spec:
+  project: default
+  source:
+    # Point to the user's repository target URL when deployed in production
+    repoURL: 'https://github.com/YOUR_GITHUB_USERNAME/gpu-platform-on-eks.git'
+    targetRevision: HEAD
+    path: 02-platform/karpenter
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true     # Automatically deletes resources in EKS if deleted from Git
+      selfHeal: true  # Automatically overrides manual changes in EKS to match Git

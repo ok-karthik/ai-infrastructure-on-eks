@@ -1,0 +1,16 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-pool
+spec:
+  amiFamily: AL2023 # Use Amazon Linux 2023 for GPU instances
+  role: dev-eks-cluster-karpenter-node-role # The node IAM role Karpenter-launched instances will assume
+  amiSelectorTerms:
+    # Use name matching to discover the official GPU-optimized EKS AMIs
+    - name: amazon-eks-node-al2023-x86_64-nvidia-*
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: dev-eks-cluster
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: dev-eks-cluster
