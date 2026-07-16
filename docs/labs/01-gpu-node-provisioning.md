@@ -9,11 +9,11 @@ Configure Karpenter to dynamically provision GPU-optimized AWS EC2 instances (`g
 
 ```mermaid
 graph TD
-    Pod[Pending GPU Pod] -->|1. Requests Resource: nvidia.com/gpu| Scheduler[K8s Scheduler]
-    Scheduler -->|2. Identifies Unschedulable| Karp[Karpenter Controller]
-    Karp -->|3. Resolves NodePool & EC2NodeClass constraints| Fleet[AWS EC2 Fleet API]
-    Fleet -->|4. Provisions Spot Instance| Node[GPU Worker Node]
-    Node -->|5. Registers with EKS Control Plane| Kubelet[Kubelet Service]
+    Pod[Pending GPU Pod] -->|Requests Resource: nvidia.com/gpu| Scheduler[K8s Scheduler]
+    Scheduler -->|Identifies Unschedulable| Karp[Karpenter Controller]
+    Karp -->|Resolves NodePool & EC2NodeClass constraints| Fleet[AWS EC2 Fleet API]
+    Fleet -->|Provisions Spot Instance| Node[GPU Worker Node]
+    Node -->|Registers with EKS Control Plane| Kubelet[Kubelet Service]
 ```
 
 ---
@@ -21,7 +21,6 @@ graph TD
 ## Configuration Reference
 
 ### 1. `NodePool` Definition (`02-platform/karpenter/karpenter-gpu-nodepool.yaml`)
-Defines the scheduling constraints, requirements (e.g. Spot capacity, instance types), taints, and scaling limits for the compute nodes.
 ```yaml
 apiVersion: karpenter.sh/v1
 kind: NodePool
@@ -61,7 +60,6 @@ spec:
 ```
 
 ### 2. `EC2NodeClass` Definition (`02-platform/karpenter/karpenter-gpu-nodeclass.yaml`)
-Defines AWS-specific infrastructure configuration:
 ```yaml
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
@@ -84,73 +82,69 @@ spec:
 
 ## Execution Commands
 
-### 1. Apply Karpenter Manifests
-Deploy the NodePool and EC2NodeClass to the cluster:
-```bash
-kubectl apply -f 02-platform/karpenter/karpenter-gpu-nodeclass.yaml
-kubectl apply -f 02-platform/karpenter/karpenter-gpu-nodepool.yaml
-```
+*   **Purpose:** Apply Karpenter custom resources to the EKS cluster.
+    *   **Command:**
+        ```bash
+        kubectl apply -f 02-platform/karpenter/karpenter-gpu-nodeclass.yaml
+        kubectl apply -f 02-platform/karpenter/karpenter-gpu-nodepool.yaml
+        ```
+    *   **Expected Result:** custom resource configuration schemas created.
+    *   **Validation:** Verify Karpenter NodePool status: `kubectl get nodepools`
 
-### 2. Deploy Test GPU Workload
-Submit a workload requesting GPU capacity to trigger a scale-up event:
-```bash
-kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
-```
+*   **Purpose:** Deploy a sample workload to trigger dynamic scale-up.
+    *   **Command:**
+        ```bash
+        kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
+        ```
+    *   **Expected Result:** Karpenter detects the pending pod and provisions an EC2 instance.
+    *   **Validation:** Monitor joining node: `kubectl get nodes -l accelerator=nvidia-gpu -w`
 
-### 3. Inspect Karpenter Logs
-Observe Karpenter intercepting the pending pod and resolving the EC2 capacity:
-```bash
-kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=100 -f
-```
-
----
-
-## Expected Output
-Karpenter controller logs:
-```text
-2026-07-15T20:26:10Z INFO karpenter.scheduler Found 1 pending pod(s) requesting nvidia.com/gpu: 1
-2026-07-15T20:26:11Z INFO karpenter.scheduler Nominated nodeclaim gpu-pool-abc12 for pod default/gpu-test-pod-1
-2026-07-15T20:26:12Z INFO karpenter.cloudprovider Created nodeclaim gpu-pool-abc12 with instance g4dn.xlarge, zone us-east-1a, capacity-type spot
-2026-07-15T20:26:45Z INFO karpenter.node Registered new node dev-eks-cluster-gpu-pool-abc12
-```
+*   **Purpose:** View Karpenter scheduler logs.
+    *   **Command:**
+        ```bash
+        kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=100
+        ```
+    *   **Expected Result:** Logging outputs confirming instance creation triggers.
+    *   **Validation:** Match EC2 instance ID to node status list.
 
 ---
 
 ## Verification Steps
 
-### 1. Check Node Join Status
-Verify that the new GPU worker node has successfully joined the cluster:
-```bash
-kubectl get nodes -l accelerator=nvidia-gpu
-```
-
-### 2. Inspect Node Taints & Labels
-Ensure Karpenter correctly applied the designated taints and labels to prevent CPU workloads from landing on the node:
-```bash
-kubectl get node -l accelerator=nvidia-gpu -o jsonpath='{.items[*].spec.taints}'
-```
-Expected output:
-```json
-[{"effect":"NoSchedule","key":"nvidia.com/gpu","value":"true"}]
-```
+*   **Purpose:** Verify that taints are applied successfully on the node.
+    *   **Command:**
+        ```bash
+        kubectl get node -l accelerator=nvidia-gpu -o jsonpath='{.items[*].spec.taints}'
+        ```
+    *   **Expected Result:** `[{"effect":"NoSchedule","key":"nvidia.com/gpu","value":"true"}]`
+    *   **Validation:** Confirm standard CPU pods cannot be scheduled on the host.
 
 ---
 
 ## Cleanup
-Deregister the workload to trigger Karpenter scale-down and consolidation:
-```bash
-kubectl delete -f 03-workloads/gpu-test-pod-workloads.yaml
-```
+*   **Purpose:** Delete the test pod and trigger node consolidation.
+    *   **Command:**
+        ```bash
+        kubectl delete -f 03-workloads/gpu-test-pod-workloads.yaml
+        ```
+    *   **Expected Result:** Node drained and terminated.
+    *   **Validation:** Verify node deletion: `kubectl get nodes`
 
 ---
 
-> [!NOTE] Engineering Note: Karpenter Provisioning Timing
-> Karpenter provisions the EC2 instance and registers the node in Kubernetes *before* actual GPU device capacity is advertised. GPU resource availability (`nvidia.com/gpu`) only appears in the node's allocatable capacity status *after* the GPU Operator has successfully loaded kernel drivers and registered the NVIDIA Device Plugin with Kubelet.
+> [!NOTE] Production Note: Karpenter Provisioning Timing
+> Karpenter provisions compute instances and registers them as ready nodes *before* GPU resource capacities are advertised by Kubelet. GPU resource capacity availability only appears in Node Status once the GPU Operator completes driver builds and boots the Kubernetes Device Plugin.
 
 ---
 
-## Interview Takeaways
+## Design Decisions
+*   **Spot Capacity Priority:** Configured to target AWS Spot instances (`karpenter.sh/capacity-type: spot`) to reduce idle compute costs.
+*   **Strict Taints Isolation:** Imposed `nvidia.com/gpu=true:NoSchedule` to prevent standard non-GPU workloads from occupying multi-resource GPU nodes.
+*   **AL2023 GPU AMI Selector:** Targeted official NVIDIA-optimized EKS AMIs to bypass compiling driver layers at node boot.
 
-*   **Whiteboard Diagramming:** Be prepared to map out how Karpenter intercepts the pending pod queue (evaluating taints/tolerations, labels, and CPU/GPU resources) and translates this directly to the AWS EC2 Fleet API (`CreateFleet`), bypassing legacy Auto Scaling Groups.
-*   **Instance Selection Decisions:** Karpenter selects instance types based on the specifications in the `NodePool` requirements (e.g. constraints limiting selection to `g4dn` or `g6` families) and selects the most cost-efficient instance available in the target AWS Subnet zones.
-*   **Taint Isolation Rationale:** Explain that the `nvidia.com/gpu=true:NoSchedule` taint is necessary to ensure standard CPU microservices do not schedule on expensive GPU nodes, preventing resource exhaustion and cost runaways.
+---
+
+## Related Documentation
+*   **Core Systems:** [Architecture Topology](../architecture.md) | [Troubleshooting Runbook](../troubleshooting.md) | [Performance Profiling](../performance.md)
+*   **Detailed Labs:** [02: GPU Operator](02-gpu-operator.md) | [03: Device Plugin](03-device-plugin.md) | [04: Time-Slicing](04-time-slicing.md) | [05: Observability](05-dcgm-observability.md) | [06: Troubleshooting](06-production-troubleshooting.md)
+*   **Journal Logs:** [Post-Mortems & Lessons Learned](../lessons-learned.md)

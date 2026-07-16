@@ -6,7 +6,7 @@
 [![Karpenter](https://img.shields.io/badge/Karpenter-v1.13-orange.svg?style=flat-square)](https://karpenter.sh/)
 [![GitOps](https://img.shields.io/badge/GitOps-Argo%20CD-red.svg?logo=argo&style=flat-square)](https://argoproj.github.io/argo-cd/)
 
-A production-ready blueprint for an GPU-optimized Kubernetes platform on AWS, designed for scaling, partitioning, and observing NVIDIA GPU workloads. It implements dynamic compute provisioning, GPU Time-Slicing virtualization, and hardware observability.
+A production-ready blueprint for an EKS-based AI Infrastructure Platform, optimized for provisioning, scaling, partitioning, and observing NVIDIA GPU workloads.
 
 ---
 
@@ -27,12 +27,12 @@ flowchart TD
         EKS --> ArgoCD
     end
 
-    subgraph Runtime ["3. Hardware Runtime Layer (NVIDIA Operator)"]
-        GPUOp[NVIDIA GPU Operator]
+    subgraph Runtime ["3. Hardware Runtime Layer (GPU Operator)"]
+        GPUOp[GPU Operator]
         Driver[Kernel Drivers]
         Toolkit[NVIDIA Container Toolkit]
-        DevPlugin[NVIDIA Device Plugin]
-        TimeSlicing[GPU Time-Slicing Config]
+        DevPlugin[Kubernetes Device Plugin]
+        TimeSlicing[GPU Time Slicing Config]
         CUDA[CUDA Matrix Workload]
 
         Karpenter -->|Provisions Node| GPUOp
@@ -43,8 +43,8 @@ flowchart TD
         TimeSlicing --> CUDA
     end
 
-    subgraph Observability ["4. Observability Stack (DCGM / Prom)"]
-        DCGM[NVIDIA DCGM Exporter]
+    subgraph Observability ["4. Observability Stack (DCGM Exporter / Prom)"]
+        DCGM[DCGM Exporter]
         Prometheus[Prometheus Metrics Engine]
         Grafana[Grafana Dashboard]
 
@@ -63,12 +63,25 @@ flowchart TD
 
 ---
 
+## What this platform demonstrates
+
+*   **Provision GPU nodes dynamically** with Karpenter based on pending workload requirements.
+*   **Deploy NVIDIA GPU Operator** using Helm to manage driver compile and loading lifecycles.
+*   **Configure GPU Time Slicing** to share VRAM resources across multiple concurrent containers.
+*   **Run CUDA workloads** on EKS using target taints to validate execution sandboxes.
+*   **Observe GPU metrics** with DCGM Exporter, extracting hardware metrics on port 9400.
+*   **Visualize GPU utilization** in Grafana using Prometheus metrics scrape channels.
+*   **Investigate Kubernetes Device Plugin failures** and runtime recovery procedures under load.
+*   **Troubleshoot GPU scheduling** bottlenecks and node lifecycle consolidation disruptions.
+
+---
+
 ## Core Features
 
 *   **Dynamic Autoscaling:** I configured Karpenter NodePools to match GPU-specific resource demands (`nvidia.com/gpu`), scaling out spot compute instances (`g4dn`, `g6` families) to minimize execution costs.
-*   **Automated GPU Lifecycle:** Instantiated the NVIDIA GPU Operator to load kernel modules, configure the container runtime hook, and execute CUDA validators.
-*   **Virtual GPU Partitioning:** Implemented GPU Time-Slicing to divide physical GPUs into multiple virtual slices, enabling smaller workloads to share resources.
-*   **Observability Pipeline:** Integrated NVIDIA DCGM Exporter with Prometheus and Grafana, capturing real-time SM execution and core temperatures.
+*   **Automated GPU Lifecycle:** Instantiated the GPU Operator to load kernel modules, configure the container runtime hook, and execute CUDA validators.
+*   **Virtual GPU Partitioning:** Implemented GPU Time Slicing to divide physical GPUs into multiple virtual slices, enabling smaller workloads to share resources.
+*   **Observability Pipeline:** Integrated DCGM Exporter with Prometheus and Grafana, capturing real-time SM execution and core temperatures.
 
 ---
 
@@ -135,9 +148,9 @@ The following visual checkpoints demonstrate the verified state of the platform:
 Displays high-resolution SM utility spikes, memory allocations, and thermal states:
 ![Grafana Performance Dashboard](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/grafana_gpu_dashboard.png)
 
-### 2. GPU Time-Slicing Architecture
+### 2. GPU Time Slicing Architecture
 Conceptual layout illustrating physical-to-virtual GPU resource partitioning:
-![GPU Time-Slicing Architecture Diagram](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/gpu_time_slicing_diagram.png)
+![GPU Time Slicing Architecture Diagram](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/gpu_time_slicing_diagram.png)
 
 ### 3. Dynamic Provisioning
 Karpenter controller logs capturing EKS dynamic scale-up requests:
@@ -152,7 +165,7 @@ Device verification output inside container namespaces using `nvidia-smi`:
 ## Engineering Investigations & Outcomes
 
 *   **Validated** Kubelet-to-Device Plugin contracts, tracing `Register()`, `ListAndWatch()`, and `Allocate()` gRPC cycles.
-*   **Investigated** multi-tenant sharing methodologies, evaluating VRAM limits under GPU Time-Slicing, MIG, and MPS.
+*   **Investigated** multi-tenant sharing methodologies, evaluating VRAM limits under GPU Time Slicing, MIG, and MPS.
 *   **Profiled** low-level metrics (`dcgm_sm_copy`, `dcgm_xid_errors`), implementing alert rules for hardware throttling and bus faults.
 *   **Troubleshot** real-world failure patterns including container runtime loops, invalid config mapping boundaries, and Karpenter multi-resource scheduling bottlenecks.
 

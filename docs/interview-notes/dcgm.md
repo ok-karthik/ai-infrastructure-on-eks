@@ -1,12 +1,12 @@
-# Systems Architecture: GPU Observability & Telemetry
+# Systems Design: GPU Observability & Telemetry
 
-This document contains deep-dive interview preparation notes, systems design, and conceptual guides on GPU observability using NVIDIA DCGM (Data Center GPU Manager) and Prometheus.
+This document details GPU observability and telemetry systems using the DCGM Exporter and Prometheus on EKS.
 
 ---
 
 ## Observability Architecture
 
-GPU observability requires scraping internal device registers and sensor matrices. NVIDIA DCGM runs on the host and exposes these metrics to the Prometheus scraper daemon via the DCGM Exporter.
+GPU observability requires scraping internal device registers and sensor matrices. The DCGM Exporter runs as a DaemonSet on all GPU-enabled nodes to expose these metrics.
 
 ```mermaid
 graph LR
@@ -28,8 +28,6 @@ graph LR
 
 ## Important Production Metrics
 
-When operating GPU platforms at scale, monitoring standard CPU and memory metrics is insufficient. You must track hardware health, compute occupancy, memory bandwidth, and throttling signals:
-
 | Metric Name | Description | Diagnostic Value |
 |---|---|---|
 | `dcgm_sm_copy` | Streaming Multiprocessor (SM) utility percentage. | Measures execution load and code parallelism. |
@@ -45,30 +43,30 @@ When operating GPU platforms at scale, monitoring standard CPU and memory metric
 
 ## Technical Deep-Dives
 
-### 1. DCGM Exporter Mechanics
-The DCGM Exporter runs as a DaemonSet on all GPU-enabled nodes.
-*   **API Interface:** It binds to the host's `/var/lib/nvidia` driver directory and uses gRPC/NVML channels to communicate with the driver interface.
-*   **Telemetry Processing:** It gathers raw metrics from the driver at high frequency, matches them against active pod details (queried from Kubelet's local API endpoint), and exposes the mapped results (annotated with pod name, namespace, and container details) on port `9400/metrics`.
+### 1. DCGM Exporter Pod Mapping
+The DCGM Exporter queries Kubelet's local pod resources API endpoint (`/var/lib/kubelet/pod-resources/kubelet.sock`) to map container IDs and GPU device UUIDs to pod metadata namespaces. This maps raw hardware counters to specific Kubernetes resources.
 
-### 2. Throttling and Clock Violations
-When a GPU runs heavy workloads, its core frequency might drop. DCGM captures this via `dcgm_clock_throttle_reasons`:
-*   **Power Throttling:** The GPU is restricted by its configured electrical cap (e.g. TDP limits).
-*   **Thermal Throttling:** Temp limits (e.g. 85°C) are reached, and the GPU drops clock speeds to prevent hardware degradation.
-*   **SW Thermal Throttling:** Software safety limits restrict clocks to prevent rapid thermal expansion.
+### 2. XID Error Codes
+An XID error is a critical system event logged by the NVIDIA driver. A non-zero value represents a driver or hardware fault:
+*   **XID 31:** Memory page fault (workload attempting to read out of bounds).
+*   **XID 43:** GPU driver crash (often requiring a node reboot).
+*   **XID 45:** PCIe bus error (hardware disconnection, node transitions to `NotReady`).
+
+### 3. Throttling Mechanics
+*   **Power Throttling:** TDP limits are saturated, restricting clocks.
+*   **Thermal Throttling:** Core temperature reaches high safety limits (e.g., 85°C), forcing clock drops.
 
 ---
 
-## Common Interview Questions & Answers
+## Operational Notes
+*   **SM Occupancy Metric Priority:** Standard CPU metrics are insufficient for GPU scaling. Decide scaling rules based on `dcgm_sm_copy` or `dcgm_fb_used`.
+*   **High-Resolution Scrapes:** Because GPU executions run in transient bursts, scrape intervals must be reduced to 5s to avoid metric smoothing.
+*   **Alerting Triggers:** Configure Prometheus Alertmanager rules to alert on `dcgm_xid_errors > 0` to identify crashing node hardware.
+*   **Socket Path Access:** The DCGM Exporter requires host path mounts to read Kubelet socket endpoints for metadata injection.
 
-### Q1: How do you identify a GPU hardware error in Kubernetes logs?
-**Answer:** We monitor the `dcgm_xid_errors` metric. An XID error is a system event logged to `syslog` by the NVIDIA driver. A value of `0` means no issues. Any non-zero value represents a specific driver or hardware fault. For example:
-*   **XID 31:** Memory page fault (workload read outside of bounds).
-*   **XID 43:** GPU driver crash (often requiring a node reboot).
-*   **XID 45:** PCIe bus error (hardware disconnection, node becomes NotReady).
-We configure Prometheus Alertmanager rules on `dcgm_xid_errors > 0` to page Specalists immediately.
+---
 
-### Q2: Why is the `dcgm_sm_copy` metric more accurate for ML scaling than container CPU metrics?
-**Answer:** Container CPU metrics only track host CPU usage. A GPU container executing PyTorch might report 10% CPU usage because it does not block host CPU cycles, but its GPU SM usage (`dcgm_sm_copy`) might be at 100%. SM occupancy directly measures how many GPU Execution Units are active. Scaling decision rules must evaluate `dcgm_sm_copy` or `dcgm_fb_used` to handle scaling demands accurately.
-
-### Q3: How does the exporter associate raw GPU metrics with specific Kubernetes Pod names?
-**Answer:** The DCGM Exporter queries the local Kubelet pod resources API endpoint (`/var/lib/kubelet/pod-resources/kubelet.sock`) to discover the active mapping between container IDs, GPU device UUIDs, and Kubernetes pod namespaces. It merges this mapping with raw device statistics, injecting labels like `pod`, `namespace`, and `container` into the prometheus metric payload dynamically.
+## Related Documentation
+*   **Core Systems:** [Architecture Topology](../architecture.md) | [Troubleshooting Runbook](../troubleshooting.md) | [Performance Profiling](../performance.md)
+*   **Sub-Component Architecture:** [Device Plugin Interface](device-plugin.md) | [GPU Operator Internals](gpu-operator.md) | [Virtualization Models](time-slicing.md) | [Karpenter Scheduling](karpenter.md)
+*   **Detailed Labs:** [05: Observability](../labs/05-dcgm-observability.md)

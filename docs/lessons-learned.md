@@ -1,197 +1,177 @@
 # Engineering Journal: Post-Mortems & Lessons Learned
 
-This journal documents the actual troubleshooting sessions, post-mortems, and engineering insights gained during the development and optimization of the AI Infrastructure Platform on Amazon EKS.
+This journal documents the troubleshooting sessions and post-mortems resolved during the optimization of the AI Infrastructure Platform on Amazon EKS.
 
 ---
 
-## 1. Post-Mortem: Broken ClusterPolicy After Enabling Time-Slicing
-
-### Background
-To support multi-tenant workloads, we attempted to enable GPU Time-Slicing on the EKS cluster. We created a custom ConfigMap with a division factor of 4 and patched the GPU Operator `ClusterPolicy` to load this configuration.
+## 1. Post-Mortem: Broken ClusterPolicy After Enabling GPU Time Slicing
 
 ### Incident
-Immediately after applying the patch, all GPU nodes transitioned their `nvidia.com/gpu` capacity to `0`. All pending and running GPU pods stalled or crashed. The GPU Operator pods fell into a loop, continually trying to reconcile resources.
+After applying a GPU Time Slicing configuration, the EKS nodes reported `nvidia.com/gpu: 0` allocatable capacity. Active GPU workloads failed scheduling. The GPU Operator entered a reconciliation loop error state.
 
-### Debugging Steps
-1.  **Check ClusterPolicy Status:**
-    ```bash
-    kubectl get clusterpolicy default -o yaml
-    ```
-    We observed that the `devicePlugin` reconciliation loop reported status: `Error: failed to reconcile device-plugin daemonset: ConfigMap "time-slicing-config" not found`.
-2.  **Verify ConfigMap Namespace:**
-    We checked where the ConfigMap was created:
-    ```bash
-    kubectl get configmap -A | grep time-slicing
-    ```
-    *Discovery:* The ConfigMap was mistakenly deployed in the `default` namespace, while the GPU Operator is hosted in the `gpu-operator` namespace. The operator was looking inside its own namespace and couldn't find the configuration.
+### Diagnostic Steps
+*   **Purpose:** Inspect ClusterPolicy resource status logs.
+    *   **Command:**
+        ```bash
+        kubectl get clusterpolicy default -o yaml
+        ```
+    *   **Expected Result:** The `devicePlugin` section status contains a configuration error.
+    *   **Validation:** Verify error: `ConfigMap "time-slicing-config" not found`.
+*   **Purpose:** Search for the ConfigMap placement.
+    *   **Command:**
+        ```bash
+        kubectl get configmap -A | grep time-slicing
+        ```
+    *   **Expected Result:** ConfigMap discovered in the `default` namespace.
+    *   **Validation:** Confirm the GPU Operator is in `gpu-operator` and cannot read across namespaces.
 
 ### Resolution
-Redeploy the ConfigMap explicitly inside the `gpu-operator` namespace and trigger a restart of the operator:
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: device-plugin-config
-  namespace: gpu-operator
-...
-```
+*   Re-deploy the ConfigMap to the `gpu-operator` namespace.
+    ```yaml
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: device-plugin-config
+      namespace: gpu-operator
+    ```
 
-### Key Lesson
-Kubernetes Operator components expect dependent configuration objects (like ConfigMaps or Secrets) to exist inside the operator's home namespace unless a cross-namespace reference parameter is explicitly supported.
+### Lessons Learned
+*   Operator configurations must exist in the operator's namespace to be visible to the reconciliation controllers.
 
 ---
 
-## 2. Post-Mortem: Fixing the Malformed ConfigMap (Missing `resources`)
-
-### Background
-We attempted to deploy a configuration to divide physical GPUs.
+## 2. Post-Mortem: Fixing Malformed ConfigMap (Missing `resources`)
 
 ### Incident
-The ConfigMap was successfully created in the correct `gpu-operator` namespace, and the `ClusterPolicy` reconciled. However, the nodes still advertised only `1` GPU instead of `4`. The Device Plugin container logs reported:
-```text
-Error parsing time-slicing configuration: no resources specified
-```
+The ConfigMap was placed in the `gpu-operator` namespace, but the node advertised only `1` GPU instead of `4` virtual slices. Exporter logs reported: `no resources specified`.
 
-### Debugging Steps
-1.  **Examine ConfigMap Data:**
-    ```bash
-    kubectl get configmap -n gpu-operator device-plugin-config -o yaml
-    ```
-2.  **Compare with Schema Specs:**
-    We compared our YAML with the official NVIDIA documentation.
-    *Discovery:* We had written the replicas block directly under `sharing.timeSlicing` without the nested `resources` list.
-    *Malformed YAML:*
+### Diagnostic Steps
+*   **Purpose:** Verify ConfigMap data.
+    *   **Command:**
+        ```bash
+        kubectl get configmap -n gpu-operator device-plugin-config -o yaml
+        ```
+    *   **Expected Result:** YAML block missing nesting constraints.
+    *   **Validation:** Checked structure against NVIDIA's specifications, identifying that `replicas` was declared without the nesting array key `resources`.
+
+### Resolution
+*   Adjusted YAML mapping keys:
     ```yaml
     sharing:
       timeSlicing:
-        name: nvidia.com/gpu
-        replicas: 4
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4
     ```
-    The parser checks for a list under `resources`. Since it couldn't find it, it raised a parsing warning and ignored the configuration.
 
-### Resolution
-Corrected the nesting structure:
-```yaml
-sharing:
-  timeSlicing:
-    resources:
-      - name: nvidia.com/gpu
-        replicas: 4
-```
-
-### Key Lesson
-Configuration parameters for low-level device plugins are strict. Validate configurations against official schema configurations before updating active configurations.
+### Lessons Learned
+*   Verify configuration structures against schema files before deploying to cluster environments.
 
 ---
 
-## 3. Post-Mortem: Device Plugin & GPU Feature Discovery CrashLoopBackOff
-
-### Background
-Newly provisioned GPU worker nodes were joining the cluster via Karpenter scale-up.
+## 3. Post-Mortem: GPU Feature Discovery CrashLoopBackOff
 
 ### Incident
-The nodes registered, but the GPU Feature Discovery (GFD) and Device Plugin pods constantly crashed, remaining in `CrashLoopBackOff` status. The node labels and allocatable capacity were not updated.
+Newly provisioned GPU worker nodes joined the cluster but Node Feature Discovery (NFD) and Kubernetes Device Plugin pods entered `CrashLoopBackOff`. Node capacity remained unadvertised.
 
-### Debugging Steps
-1.  **Check Pod Logs:**
-    ```bash
-    kubectl logs -n gpu-operator -l app=nvidia-gpu-feature-discovery
-    ```
-    Error output:
-    ```text
-    Error: failed to write labels: permission denied /etc/kubernetes/node-feature-discovery/features.d/
-    ```
-2.  **Investigate Host Paths:**
-    The host path `/etc/kubernetes/node-feature-discovery/features.d/` is used by NFD to write dynamic node features. On our Amazon Linux 2023 nodes, this folder had strict `root:root` write limits. The GFD container was running under a restricted security context, blocking it from executing write calls.
+### Diagnostic Steps
+*   **Purpose:** Retrieve logs from the failing NFD helper container.
+    *   **Command:**
+        ```bash
+        kubectl logs -n gpu-operator -l app=nvidia-gpu-feature-discovery
+        ```
+    *   **Expected Result:** IO permission write failures.
+    *   **Validation:** Verify error: `failed to write labels: permission denied /etc/kubernetes/node-feature-discovery/features.d/`.
 
 ### Resolution
-Configure the GFD and NFD DaemonSets in the `ClusterPolicy` to run with root permissions and privileged security contexts:
-```yaml
-spec:
-  devicePlugin:
-    securityContext:
-      privileged: true
-  gfd:
-    securityContext:
-      privileged: true
-```
+*   Re-configure the GPU Operator's `ClusterPolicy` to run helper daemons with root execution contexts:
+    ```yaml
+    spec:
+      devicePlugin:
+        securityContext:
+          privileged: true
+      gfd:
+        securityContext:
+          privileged: true
+    ```
 
-### Key Lesson
-Low-level hardware discovery and interface plugins must run with privileged host context permissions to interact with host device paths and sockets.
+### Lessons Learned
+*   Hardware discovery agents require privileged host path mounts to write telemetry and capability labels to the node.
 
 ---
 
-## 4. Post-Mortem: Why Karpenter Created an Extra GPU Node
-
-### Background
-We launched a job requesting a single GPU, expecting Karpenter to boot 1 node and execute the workload.
+## 4. Post-Mortem: Unexpected Dynamic Scaling Node Launch
 
 ### Incident
-Karpenter scaled up a GPU node (`g4dn.xlarge`). However, immediately after it booted, Karpenter launched a *second* GPU node. The first node remained underutilized, running standard CPU pods.
+Scheduling a single GPU pod caused Karpenter to provision *two* EKS GPU instances, leaving the first instance underutilized.
 
-### Debugging Steps
-1.  **Analyze Karpenter Scheduling Decisions:**
-    ```bash
-    kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=100
+### Diagnostic Steps
+*   **Purpose:** Inspect Karpenter scheduling logs.
+    *   **Command:**
+        ```bash
+        kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=100
+        ```
+    *   **Expected Result:** Node allocation logs detailing scaling reasons.
+    *   **Validation:** Identified that CPU-only workloads scheduled on the first GPU instance because it lacked strict selectors. When the second GPU pod arrived, the first GPU host was out of CPU capacity, forcing another node launch.
+
+### Resolution
+*   Configure all GPU jobs with strict node selectors to prevent standard workloads from occupying CPU capacities:
+    ```yaml
+    nodeSelector:
+      accelerator: nvidia-gpu
     ```
-    *Discovery:* The first GPU node booted. However, because our GPU pod did not declare a strict Node Selector or Node Affinity (only a Toleration), other standard CPU pods in the cluster scheduled on the newly booted GPU node, filling its remaining CPU limits. 
-    When the second GPU workload pod arrived, the first GPU node had plenty of physical GPU capacity left, but its *CPU allocatable space* was fully exhausted. Karpenter was forced to launch a second GPU node to satisfy the CPU request of the second GPU pod.
 
-### Resolution
-Enforce Node Selectors on the GPU workloads so only pods requiring GPUs can schedule on those nodes, and configure CPU resource requests properly.
-```yaml
-nodeSelector:
-  accelerator: nvidia-gpu
-```
-
-### Key Lesson
-GPU nodes are multi-resource machines. CPU and memory capacities can become bottlenecks before GPU capacity is exhausted. Enforce strict selectors to isolate compute.
+### Lessons Learned
+*   Enforce strict node selectors and taints to isolate multi-resource GPU machines from CPU workloads.
 
 ---
 
-## 5. Post-Mortem: Why DCGM Metric Exporters Showed Only a Single Pod Under Time-Slicing
-
-### Background
-We scheduled 4 concurrent workloads on a single physical GPU partitioned via Time-Slicing.
+## 5. Post-Mortem: Single Pod Label under GPU Time Slicing
 
 ### Incident
-When reviewing Prometheus queries, the `dcgm_sm_copy` metric showed only 1 pod label, while the other 3 pods reported empty namespace and pod metadata.
+When running 4 concurrent pods sharing a GPU, Prometheus queries only returned pod and namespace metadata labels for the first pod.
 
-### Debugging Steps
-1.  **Verify Pod-to-GPU mapping:**
-    We confirmed all 4 pods were running and consuming GPU capacity.
-2.  **Investigate Exporter Mapping Logic:**
-    The DCGM Exporter queries Kubelet's `/var/lib/kubelet/pod-resources/kubelet.sock` to map container cgroups to GPU UUIDs.
-    *Discovery:* Under Time-Slicing, all 4 containers are mapped to the identical physical GPU device UUID (`GPU-70e2...`). The exporter associates the UUID with the first pod it queries from Kubelet. Since it maps 1:1, it associates the GPU metrics only with the first pod it finds, leaving the other 3 pods unmapped.
+### Diagnostic Steps
+*   **Purpose:** Check pod process execution.
+    *   **Command:**
+        ```bash
+        kubectl get pods -l app=gpu-load-test
+        ```
+    *   **Expected Result:** 4 pods reported as running.
+    *   **Validation:** Checked the NVML socket mapper mapping database, discovering that the cgroup-to-UUID link maps 1:1, binding the metric to the first container queried.
 
 ### Resolution
-This is a design limitation of GPU Time-Slicing. To track per-pod metrics, you must use MIG (Multi-Instance GPU), which exposes distinct physical hardware instances per container.
+*   Acknowledge Time Slicing cgroup metric limitations. Migrate to Multi-Instance GPU (MIG) when strict per-container usage reporting is required.
 
 ---
 
-## 6. Post-Mortem: Why `nvidia-smi` Reported No Processes inside Containers
-
-### Background
-We ran a heavy CUDA training run inside a pod.
+## 6. Post-Mortem: nvidia-smi Reports No Processes inside Container
 
 ### Incident
-When executing `nvidia-smi` from inside the workload container, the top panel showed high SM usage, but the bottom processes list reported:
-```text
-No running processes found
-```
+Workloads execute CUDA calculations, but running `nvidia-smi` inside the container reports: `No running processes found`.
 
-### Debugging Steps
-1.  **Verify Container Process Namespace:**
-    We verified that the CUDA job was indeed executing and consuming resources.
-2.  **Investigate PID namespaces:**
-    By default, Kubernetes isolates container PID namespaces. The process executing CUDA runs inside the container's PID namespace (e.g. PID 1), but the NVIDIA host driver reads PID listings from the host's root namespace (PID namespace 1). Since the container is isolated, the driver cannot map the container process ID to the host namespace list, resulting in an empty process table.
+### Diagnostic Steps
+*   **Purpose:** Verify PID namespace isolation settings.
+    *   **Command:**
+        ```bash
+        kubectl exec <pod-name> -- ps -ef
+        ```
+    *   **Expected Result:** List of running container processes.
+    *   **Validation:** Process namespace isolation (PID 1 mapping inside containerd) hides container process IDs from the host driver's reporting mechanisms.
 
 ### Resolution
-To see container processes in `nvidia-smi` for diagnostic purposes, configure the pod spec to share the host's PID namespace:
-```yaml
-spec:
-  hostPID: true
-```
+*   In diagnostic environments, allow host PID namespace sharing:
+    ```yaml
+    spec:
+      hostPID: true
+    ```
 
-### Key Lesson
-Process namespace isolation in Kubernetes masks container IDs from host drivers. Share PID namespaces only during diagnostic investigations, as it compromises isolation boundaries.
+### Lessons Learned
+*   Isolation layers mask container context from drivers. Limit host PID sharing to debug sessions.
+
+---
+
+## Related Documentation
+*   **Technical Designs:** [Architecture Topology](architecture.md) | [Performance Profiling](performance.md) | [Future Roadmap](roadmap.md)
+*   **Conceptual Focus:** [Device Plugin Interface](interview-notes/device-plugin.md) | [GPU Operator Internals](interview-notes/gpu-operator.md) | [Virtualization Models](interview-notes/time-slicing.md) | [Karpenter Scheduling](interview-notes/karpenter.md)
+*   **Operational Guides:** [Troubleshooting Runbook](troubleshooting.md) | [Hands-on Labs Index](hands-on-labs.md)

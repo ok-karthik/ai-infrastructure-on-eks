@@ -6,28 +6,21 @@ This document details the performance observations, scaling latency benchmarks, 
 
 ## 1. Metric Performance Observations
 
-During validation testing under load (e.g. executing parallel matrix calculations and inference simulation pipelines), we monitored low-level hardware metrics via DCGM and tracked their behavioral thresholds:
+During validation testing under load (e.g., executing parallel matrix calculations and inference pipelines), we monitored low-level hardware metrics via the DCGM Exporter:
 
-### GPU Utilization (`DCGM_FI_DEV_GPU_UTIL`)
-*   **Observations:** GPU Streaming Multiprocessor (SM) utilization is highly binary during short inference tasks. It jumps rapidly from `0%` to `100%` and immediately falls back. 
-*   **Platform Note:** Traditional Kubernetes metrics scrapers (like metrics-server) collect data every 15-30 seconds, which completely misses these transient GPU utilization spikes. We implemented high-resolution (5-second) scraping inside Prometheus to prevent metric smoothing.
-
-### Power Draw (`DCGM_FI_DEV_POWER_USAGE`)
-*   **Observations:** Core power consumption scales linearly with SM occupancy. A standard Tesla T4 has a Thermal Design Power (TDP) limit of 70 Watts. Under peak workloads, we observed power draw stabilizing at 68-70W.
-*   **Throttling:** When power draw hits TDP limits for extended periods, the GPU driver triggers power capping throttling (`dcgm_clock_throttle_reasons`), dropping core clock speeds to maintain thermal constraints.
-
-### Frame Buffer Memory (VRAM)
-*   **Observations:** Unlike CPU memory, VRAM cannot swap to disk when exhausted. If a model allocation exceeds physical limits (e.g. allocating 16GB on a 15GB T4 card), the CUDA application crashes immediately with an `Out Of Memory` (OOM) error.
+*   **GPU Utilization (`DCGM_FI_DEV_GPU_UTIL`):** Streaming Multiprocessor (SM) utilization is binary during inference, jumping rapidly between `0%` and `100%`. Standard Prometheus scraping (30s) misses these transients; we reduced the scrape interval to 5s.
+*   **Power Draw (`DCGM_FI_DEV_POWER_USAGE`):** Scales linearly with SM occupancy. A Tesla T4 has a 70W TDP. Under peak load, power stabilizes at 68-70W. Extended TDP saturation triggers clock throttling (`dcgm_clock_throttle_reasons`).
+*   **VRAM Allocation (`DCGM_FI_DEV_FB_USED`):** Unlike CPU memory, VRAM cannot swap to disk. Exceeding limits (e.g., loading a 16GB model onto a 15GB T4 card) triggers immediate Out Of Memory (OOM) runtime faults.
 
 ---
 
-## 2. GPU Time-Slicing Benchmark Analysis
+## 2. GPU Time Slicing Benchmark Analysis
 
-We benchmarked the scheduling and execution characteristics of running 4 concurrent pods on a single physical Tesla T4 partitioned via software Time-Slicing:
+We benchmarked the execution characteristics of running 4 concurrent pods on a single physical Tesla T4 partitioned via GPU Time Slicing:
 
 ```mermaid
 gantt
-    title GPU Time-Slicing Execution Windows
+    title GPU Time Slicing Execution Windows
     dateFormat  X
     axisFormat %s
     section Pod 1
@@ -43,8 +36,8 @@ gantt
 ```
 
 ### Key Technical Findings:
-1.  **VRAM Fragmentation:** Since Time-Slicing does not provide VRAM boundaries, the sum of the memory requested by all running containers must not exceed the physical limit of the GPU. If three containers occupy 4GB each (12GB total), the fourth container will fail if it requests more than 3GB.
-2.  **SM Latency Overhead:** Because execution is round-robin context-swapped at the driver level, we observed a **15% to 25% execution latency penalty** for deep learning workloads running concurrently compared to single-tenant executions. This latency corresponds directly to the driver overhead of loading and saving GPU register states during context rotations.
+*   **Shared VRAM Address Space:** Because GPU Time Slicing does not enforce memory boundaries, the combined memory requested by all containers must not exceed the physical GPU limit.
+*   **SM Latency Overhead:** Context-swapping compute kernels at the driver level introduces a **15% to 25% execution latency penalty** compared to single-tenant execution due to registry store/restore cycles.
 
 ---
 
@@ -55,23 +48,30 @@ We benchmarked the end-to-end latency required to transition a pending GPU pod t
 ```text
 EKS Dynamic Scale-Up Timeline:
 T=0s    --> Pod submitted, marked Pending (Insufficient resources)
-T=1.5s  --> Karpenter detects pod, calls AWS EC2 CreateFleet API
+T=1.5s  --> Karpenter detects pod, calls AWS CreateFleet API
 T=35s   --> EC2 instance booted, registers as Ready Node in EKS
-T=40s   --> NFD scans node and applies PCI capability labels
+T=40s   --> Node Feature Discovery scans node and applies PCI capability labels
 T=48s   --> GPU Operator schedules Driver container
 T=72s   --> Driver compilation and insertion complete (Host kernel module active)
-T=85s   --> Container Toolkit restarts containerd
-T=92s   --> Device Plugin registers with Kubelet
+T=85s   --> NVIDIA Container Toolkit restarts containerd
+T=92s   --> Kubernetes Device Plugin registers with Kubelet
 T=95s   --> Kubelet advertises nvidia.com/gpu; Scheduler binds Pod to Node
 T=108s  --> Workload container downloaded, CUDA validation completes, starts execution
 ```
 
 ### Bottleneck Analysis:
-*   **Kernel Compilation Gate:** The single largest contributor to boot-up latency is dynamic driver module compilation (taking ~24-30 seconds). By transitioning to pre-baked node AMIs (using the EKS-optimized AL2023 GPU image), we reduced this step to 0 seconds, bringing the end-to-end scheduling latency down to **under 45 seconds**.
+*   **Dynamic Driver Compilation:** Dynamically compiling drivers on boot introduces a ~24-30s delay. Pre-baking drivers into a custom EKS-optimized AL2023 GPU AMI reduces this compilation time to 0s, shortening the dynamic scheduling loop to **under 45 seconds**.
 
 ---
 
-## 4. Platform Engineering Lessons Learned
+## 4. Production Considerations
 
 > [!NOTE] Production Note: Sharing Strategies
-> Through benchmarking, we validated that GPU Time-Slicing is highly appropriate for lightweight, latency-tolerant services (e.g. development sandboxes or low-throughput inference endpoints). It is entirely unsuitable for high-throughput production Serving or distributed training runs, where hardware-isolated options (MIG) or compute consolidation proxies (MPS) must be deployed to guarantee latency SLAs.
+> GPU Time Slicing is appropriate for low-tier, latency-tolerant workloads (e.g., development sandboxes or low-throughput inference). It is unsuitable for production serving or distributed training. Deploy Multi-Instance GPU (MIG) or Multi-Process Service (MPS) to guarantee latency SLAs.
+
+---
+
+## Related Documentation
+*   **System Layouts:** [Architecture Topology](architecture.md) | [Troubleshooting Runbook](troubleshooting.md) | [Future Roadmap](roadmap.md)
+*   **Conceptual Focus:** [Device Plugin Interface](interview-notes/device-plugin.md) | [GPU Operator Internals](interview-notes/gpu-operator.md) | [Virtualization Models](interview-notes/time-slicing.md) | [Karpenter Scheduling](interview-notes/karpenter.md)
+*   **Journal Logs:** [Post-Mortems & Lessons Learned](lessons-learned.md)

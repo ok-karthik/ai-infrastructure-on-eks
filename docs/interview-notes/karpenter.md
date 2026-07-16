@@ -1,6 +1,6 @@
-# Systems Architecture: Dynamic Compute Provisioning via Karpenter
+# Systems Design: Dynamic Compute Provisioning via Karpenter
 
-This document contains deep-dive interview preparation notes, systems design, and conceptual guides on dynamic EKS autoscaling using Karpenter, specifically targeting GPU workloads.
+This document details dynamic EKS compute provisioning configurations and scheduling logic using Karpenter, specifically targeting GPU workloads.
 
 ---
 
@@ -31,76 +31,31 @@ graph TD
 Karpenter relies on two Custom Resource definitions to control autoscaling behavior:
 
 ### 1. `NodePool`
-*   **Role:** Defines the scheduling constraints, requirements (e.g. architecture, capacity type, instance types), taints, and scaling limits for the compute nodes.
-*   **Example Configurations for GPUs:**
-```yaml
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: gpu-pool
-spec:
-  template:
-    metadata:
-      labels:
-        accelerator: nvidia-gpu
-    spec:
-      requirements:
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: ["spot"]
-        - key: node.kubernetes.io/instance-type
-          operator: In
-          values: ["g4dn.xlarge", "g4dn.2xlarge", "g6.xlarge"]
-      taints:
-        - key: nvidia.com/gpu
-          value: "true"
-          effect: NoSchedule
-```
+*   **Role:** Defines scheduling constraints, requirements (e.g. architecture, capacity type, instance types), taints, and scaling limits for the compute nodes.
+*   **GPU Optimizations:** Restricts instance types to families like `g4dn` and `g6`, sets taints (`nvidia.com/gpu=true:NoSchedule`), and defines limits to prevent billing overruns.
 
 ### 2. `EC2NodeClass`
 *   **Role:** Defines AWS-specific configurations (e.g., subnet selectors, security group selectors, AMIs, storage volumes, and IAM roles).
-*   **Example Configurations for GPUs:**
-```yaml
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: gpu-pool
-spec:
-  amiFamily: AL2023
-  role: dev-eks-cluster-karpenter-node-role
-  amiSelectorTerms:
-    - name: amazon-eks-node-al2023-x86_64-nvidia-*
-```
+*   **GPU Optimizations:** Selects AMI selectors matching pre-baked driver tags (`amazon-eks-node-al2023-x86_64-nvidia-*`).
 
 ---
 
 ## Karpenter Disruption & Consolidation
 
-GPU nodes are highly expensive (ranging from ~$1/hr to ~$30+/hr). Karpenter implements automated consolidation policies to optimize runtime billing:
-*   **Consolidation Policy (`WhenEmptyOrUnderutilized`):** Karpenter constantly monitors GPU node utilization. If a node has no running workloads (or runs workloads that could be consolidated onto other nodes), it automatically schedules replacements, drains the active workloads, and terminates the redundant instance.
-*   **Interruption Handling:** When running Spot capacity, AWS can issue a 2-minute interruption warning. Karpenter intercepts these warnings via SQS queues and immediately begins spinning up a replacement instance, cordoning and draining the target node before the instance is forcefully terminated.
+*   **Consolidation Policy (`WhenEmptyOrUnderutilized`):** Karpenter monitors GPU node utilization. If a node is idle or runs workloads that could be consolidated onto other nodes, it schedules replacements, drains active workloads, and terminates the redundant instances to optimize cost.
+*   **Interruption Handling:** AWS Spot instances can be reclaimed with a 2-minute warning. Karpenter intercepts these warnings via SQS queues and immediately begins spinning up replacement instances, cordoning and draining the target node before termination.
 
 ---
 
-## Common Interview Questions & Answers
+## Operational Notes
+*   **ASG Bypassing Advantage:** By bypassing ASGs, Karpenter request-matches instance sizes dynamically and boots nodes in under a minute, significantly faster than traditional Cluster Autoscaler.
+*   **Multi-Resource Bottlenecks:** GPU nodes are multi-resource machines. CPU and memory capacities can become bottlenecks before GPU capacity is exhausted. Enforce strict node selectors to isolate resources.
+*   **Workload Checkpointing:** Spot instances carry interruption risks. Implement weight checkpointing to Amazon S3/EFS inside the ML training loop, and use frameworks like Ray or Volcano for batch recovery.
+*   **Isolation via Taints:** Ensure all GPU NodePools apply taints to prevent standard CPU workloads from scheduling on expensive GPU resources.
 
-### Q1: Why is Karpenter preferred over standard Cluster Autoscaler for GPU workloads on EKS?
-**Answer:** The standard Cluster Autoscaler (CA) relies on AWS Auto Scaling Groups (ASGs). To scale heterogeneous GPU hardware, you must define separate ASGs for each instance size (e.g., one ASG for `g4dn.xlarge`, one for `g4dn.2xlarge`, etc.). This causes slow scaling cycles and scheduling overhead. 
-Karpenter evaluates pending pods and communicates directly with the AWS EC2 Fleet API, request-matching instance sizes dynamically. Karpenter bypasses ASGs completely, booting the exact hardware slice required in less than a minute, which is critical for dynamic ML training or inference workloads.
+---
 
-### Q2: How does Karpenter prevent non-GPU workloads from scheduling on expensive GPU instances?
-**Answer:** By applying **Taints** on the Karpenter `NodePool` configuration:
-```yaml
-taints:
-  - key: nvidia.com/gpu
-    value: "true"
-    effect: NoSchedule
-```
-When Karpenter provisions a GPU node, it automatically writes this taint to the node object. Standard CPU pods do not tolerate this taint, so they are ignored by the scheduler during node placement. Only pods with matching tolerations (`nvidia.com/gpu=true:NoSchedule`) and selectors can schedule on these nodes.
-
-### Q3: What is the risk of using Spot instances for ML model training, and how do you mitigate it?
-**Answer:** The primary risk is sudden interruption. Spot instances can be reclaimed by AWS with a 2-minute warning, which will terminate an active training run. 
-To mitigate this:
-1.  Enable Karpenter's interruption queue monitoring to catch SQS alerts and spin up replacements immediately.
-2.  Incorporate frequent checkpointing (saving model weights to persistent storage like Amazon FSx or S3) inside the training loop.
-3.  Use Volcano or Ray to automate gang scheduling and job state recovery during node transitions.
+## Related Documentation
+*   **Core Systems:** [Architecture Topology](../architecture.md) | [Troubleshooting Runbook](../troubleshooting.md) | [Performance Profiling](../performance.md)
+*   **Sub-Component Architecture:** [Device Plugin Interface](device-plugin.md) | [GPU Operator Internals](gpu-operator.md) | [Virtualization Models](time-slicing.md) | [Telemetry Metrics](dcgm.md)
+*   **Detailed Labs:** [01: Provisioning](../labs/01-gpu-node-provisioning.md)

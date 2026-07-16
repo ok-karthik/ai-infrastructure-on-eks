@@ -1,6 +1,6 @@
 # Systems Architecture & Platform Runtime
 
-This document details the systems architecture, lifecycle orchestration, and data paths of the GPU-optimized infrastructure running on Amazon EKS.
+This document details the systems architecture, lifecycle orchestration, and data paths of the AI Infrastructure Platform on Amazon EKS.
 
 ---
 
@@ -21,12 +21,12 @@ flowchart TB
         EKS --> ArgoCD
     end
 
-    subgraph RuntimeZone ["3. Hardware Runtime Layer (NVIDIA Operator)"]
-        GPUOp[NVIDIA GPU Operator]
+    subgraph RuntimeZone ["3. Hardware Runtime Layer (GPU Operator)"]
+        GPUOp[GPU Operator]
         Driver[Kernel Drivers]
         Toolkit[NVIDIA Container Toolkit]
-        DevPlugin[NVIDIA Device Plugin]
-        TimeSlicing[GPU Time-Slicing Config]
+        DevPlugin[Kubernetes Device Plugin]
+        TimeSlicing[GPU Time Slicing Config]
         CUDA[CUDA Matrix Workload]
 
         Karpenter -->|Provisions Node| GPUOp
@@ -37,8 +37,8 @@ flowchart TB
         TimeSlicing --> CUDA
     end
 
-    subgraph ObsZone ["4. Observability Stack (DCGM / Prometheus)"]
-        DCGM[NVIDIA DCGM Exporter]
+    subgraph ObsZone ["4. Observability Stack (DCGM Exporter / Prometheus)"]
+        DCGM[DCGM Exporter]
         Prometheus[Prometheus Metrics Engine]
         Grafana[Grafana Dashboard]
 
@@ -64,9 +64,9 @@ sequenceDiagram
     participant Karp as Karpenter Controller
     participant AWS as AWS EC2 API
     participant Node as New GPU Worker Node
-    participant NFD as Node Feature Discovery (NFD)
+    participant NFD as Node Feature Discovery
     participant Operator as GPU Operator / ClusterPolicy
-    participant DevPlug as NVIDIA Device Plugin
+    participant DevPlug as Kubernetes Device Plugin
     participant Prom as Prometheus Scraper
 
     Dev->>Karp: Submit GPU Pod Request (taint + resource: nvidia.com/gpu)
@@ -75,7 +75,7 @@ sequenceDiagram
     Node->>Karp: Node joins cluster, registers ready
     NFD->>Node: Scan node, apply labels (pci-id, driver version, etc.)
     Operator->>Node: Detect labels, schedule Operator Daemons
-    Operator->>Node: Load NVIDIA Kernel Drivers & Container Toolkit
+    Operator->>Node: Load NVIDIA Kernel Drivers & NVIDIA Container Toolkit
     DevPlug->>Node: Register with Kubelet via socket, start ListAndWatch()
     DevPlug-->>Node: Expose allocatable GPU resources (e.g. nvidia.com/gpu: 1)
     Karp->>Node: Bind pending Pod to Node
@@ -88,71 +88,42 @@ sequenceDiagram
 ## Core Component Registry
 
 ### 1. Karpenter (Just-in-Time Compute Autoscaler)
-Unlike legacy Kubernetes Cluster Autoscaler (which scales AWS Auto Scaling Groups based on pending pods), Karpenter operates directly on the EKS control plane and bypasses ASGs.
-*   **Mechanics:** It intercepts pending pods, evaluates their CPU, Memory, NodeSelector, and Toleration requirements, and calls the AWS EC2 fleet APIs directly to provision the exact instance size and capacity type (Spot vs On-Demand) required.
-*   **GPU Optimizations:** Configured via `EC2NodeClass` and `NodePool` to target GPU-specific instances (e.g. G4dn, G6 families). It dynamically discovers EKS-optimized AMIs with pre-installed kernel configurations and injects custom taints (`nvidia.com/gpu=true:NoSchedule`) to isolate these expensive machines from regular CPU workloads.
+*   **Mechanics:** Evaluates pending pods' scheduling requirements (e.g., node selectors, taints, and resources like `nvidia.com/gpu`) and directly invokes the AWS EC2 Fleet API (`CreateFleet`) to provision the matching instance.
+*   **GPU Optimizations:** Configured via `EC2NodeClass` and `NodePool` to target Spot instance compute families (e.g., `g4dn`, `g6`). Implements custom taints (`nvidia.com/gpu=true:NoSchedule`) to prevent CPU-only pods from scheduling on GPU nodes.
+*   *For deep-dive configuration details, see the [Karpenter Scheduling Guide](interview-notes/karpenter.md).*
 
 > [!NOTE] Production Note: Karpenter Provisioning Timing
-> Karpenter provisions compute instances and registers them as ready nodes *before* GPU resource capacities are advertised by Kubelet. GPU resource capacity availability only appears in Node Status once the GPU Operator completes driver builds and boots the Device Plugin.
+> Karpenter provisions compute instances and registers them as ready nodes *before* GPU resource capacities are advertised by Kubelet. GPU resource capacity availability only appears in Node Status once the GPU Operator completes driver builds and boots the Kubernetes Device Plugin.
 
-### 2. Node Feature Discovery (NFD)
-*   **Role:** NFD is a Kubernetes controller that runs as a DaemonSet to detect hardware features on the underlying cluster nodes (e.g., CPU features, PCI devices, system properties) and automatically publishes them as node labels.
-*   **GPU Interaction:** NFD identifies the presence of physical NVIDIA PCI hardware IDs and writes labels such as `feature.node.kubernetes.io/pci-10de.present=true`. These labels act as the execution trigger for the NVIDIA GPU Operator.
+### 2. Node Feature Discovery
+*   **Role:** Runs as a DaemonSet to detect node hardware features (specifically physical PCI device identifiers) and publishes them as Kubernetes labels.
+*   **Operator Trigger:** Identifies the presence of physical NVIDIA PCI hardware and writes labels (e.g., `feature.node.kubernetes.io/pci-10de.present=true`), which trigger downstream GPU Operator deployments.
 
-### 3. NVIDIA GPU Operator
-*   **Role:** An advanced custom controller that automates the installation and lifecycle management of all NVIDIA software components needed to execute GPU workloads.
-*   **CRD Control (ClusterPolicy):** Managed through a single unified `ClusterPolicy` Custom Resource. The operator monitors this resource to deploy, update, and reconcile downstream daemonsets.
-*   **Driver Manager:** Compiles and loads the necessary kernel modules (e.g., `nvidia.ko`, `nvidia-uvm.ko`) on the host operating system dynamically if they are not pre-baked into the node AMI.
-*   **NVIDIA Container Toolkit:** Configures the underlying container runtime (e.g., `containerd`) to support the GPU execution layer, editing `config.toml` to register the `nvidia` runtime wrapper.
+### 3. GPU Operator
+*   **Orchestration:** Monitored via the `ClusterPolicy` Custom Resource, deploying and reconciling components dynamically on nodes labeled by Node Feature Discovery.
+*   **Driver Manager:** Compiles and loads the necessary kernel modules (e.g., `nvidia.ko`, `nvidia-uvm.ko`) dynamically if host-level drivers are not pre-baked into the AMI.
+*   **NVIDIA Container Toolkit:** Patches containerd (`/etc/containerd/config.toml`) to register the `nvidia` OCI runtime wrapper, enabling container hardware access.
+*   *For operator lifecycle mechanics, see the [GPU Operator Guide](interview-notes/gpu-operator.md).*
 
-### 4. NVIDIA Device Plugin
-*   **Role:** Operates as a DaemonSet to register physical GPU hardware resources with the local `kubelet` process.
-*   **Lifecycle API Contract:**
-    1.  **Register:** Connects to Kubelet's UNIX domain socket (`/var/lib/kubelet/device-plugins/kubelet.sock`) to announce its presence.
-    2.  **ListAndWatch:** Establishes a gRPC stream with Kubelet to continuously report the health status and availability of all local GPU devices.
-    3.  **Allocate:** Executed by Kubelet when scheduling a container requesting a GPU. The Device Plugin returns a response detailing the environment variables (`NVIDIA_VISIBLE_DEVICES`), mount paths, and device nodes (`/dev/nvidia*`) to bind to the container namespace.
+### 4. Kubernetes Device Plugin
+*   **Role:** Exposes physical GPU allocations to Kubelet.
+*   *For registration, watches (`ListAndWatch`), and allocator (`Allocate`) gRPC workflows, see the [Device Plugin Interface Guide](interview-notes/device-plugin.md).*
 
-### 5. GPU Time-Slicing
-*   **Mechanism:** A system-level partitioning mode that virtualization-enables a physical GPU. It configures the NVIDIA Device Plugin to replicate a single physical GPU device into multiple virtual devices (e.g., exposing 1 physical A10G as 4 virtual devices).
-*   **Limitations:** Unlike MIG (Multi-Instance GPU), Time-Slicing does not provide hardware-level memory or compute isolation. Workloads share the same memory space (VRAM) and execution queues. If one container runs out of VRAM or executes a run-away kernel, it can impact or crash concurrent workloads sharing that GPU.
+### 5. GPU Time Slicing
+*   **Mechanism:** software-level compute virtualization that replicates a single physical GPU device into multiple virtual units (e.g., presenting 1 physical device as 4 logical units) via a custom ConfigMap.
+*   *For sharing capabilities, memory risks, and MPS/MIG benchmarks, see the [Virtualization Models Guide](interview-notes/time-slicing.md).*
 
 > [!NOTE] Production Note: Sharing Model Risks
-> Time-Slicing is appropriate for low-tier services or inference hosting but is unsuitable for large-scale distributed training due to scheduling latency penalties. Because VRAM is shared with no hardware limits, memory leaks in one container will cause Out-of-Memory (OOM) failures in all other pods sharing that device. Multi-Instance GPU (MIG) should be deployed when hardware-level memory and compute isolation are required.
+> GPU Time Slicing is appropriate for low-tier services or inference hosting but is unsuitable for large-scale distributed training due to scheduling latency penalties. Because VRAM is shared with no hardware limits, memory leaks in one container will cause Out-of-Memory (OOM) failures in all other pods sharing that device. Multi-Instance GPU (MIG) should be deployed when hardware-level memory and compute isolation are required.
 
-### 6. NVIDIA Container Toolkit & CUDA Runtime
-*   **NVIDIA Container Toolkit:** Operates at the runtime interface layer (OCI). It intercepts container creation requests. When a container specifies `NVIDIA_VISIBLE_DEVICES`, the toolkit injects the GPU libraries and binaries (e.g., `libcuda.so`) from the host into the container's environment.
-*   **CUDA Runtime:** The software library executing inside the container. It communicates with the host driver over the unified memory (`/dev/nvidia-uvm`) and control (`/dev/nvidiactl`) character devices to compile and dispatch compute kernels to the GPU Streaming Multiprocessors (SMs).
-
-### 7. Observability Stack (DCGM Exporter, Prometheus, Grafana)
-*   **DCGM Exporter:** Runs as a DaemonSet collecting hardware statistics directly from the NVIDIA driver using the DCGM (Data Center GPU Manager) APIs. Exposes a prometheus-style endpoint on port `9400`.
-*   **Prometheus:** Configured via scrape configs to pull raw metrics from the DCGM Exporter DaemonSet at high-resolution intervals (5s).
-*   **Grafana:** Deployed with custom dashboards querying Prometheus data sources to visualize SM occupancy, memory bandwidth, temperature limits, and throttling metrics.
+### 6. DCGM Exporter & Observability Stack
+*   **DCGM Exporter:** Exposes GPU hardware metrics (e.g. temperatures, SM clocks, memory usage) gathered from NVML driver hooks on port `9400/metrics`.
+*   **Observability Pipeline:** Scrapes exporter endpoints with Prometheus and visualizes device limits on custom Grafana dashboards.
+*   *For key metric definitions and alerting threshold rules, see the [Telemetry Metrics Guide](interview-notes/dcgm.md).*
 
 ---
 
-## Bootstrapping Sequence & Dependency Flow
-
-```mermaid
-graph TD
-    NodeReady[1. Node Ready state]
-    NFDRun[2. NFD labels node]
-    OpDriver[3. GPU Operator compiles & loads kernel drivers]
-    OpToolkit[4. GPU Operator installs Container Toolkit & restarts containerd]
-    DevPluginReg[5. Device Plugin registers with Kubelet]
-    KubeletAd[6. Kubelet advertises nvidia.com/gpu capacity]
-    PodBound[7. Karpenter binds pending Pod to Node]
-    CUDAExec[8. CUDA workload begins execution]
-
-    NodeReady --> NFDRun
-    NFDRun --> OpDriver
-    OpDriver --> OpToolkit
-    OpToolkit --> DevPluginReg
-    DevPluginReg --> KubeletAd
-    KubeletAd --> PodBound
-    PodBound --> CUDAExec
-```
-
-### Critical Dependency Gates:
-*   **Driver Execution Gate:** The Container Toolkit and Device Plugin cannot start until the kernel drivers are successfully compiled and loaded on the host.
-*   **Runtime Restart Gate:** The Container Toolkit must patch the container daemon config (e.g. containerd `config.toml`) and perform a soft restart of the runtime daemon. Any active pod scheduling during this restart window will experience a brief container creation delay.
-*   **Device Registration Gate:** Kubelet will not advertise any GPU resources to the Kubernetes scheduler until the Device Plugin has completed its `Register()` call and established the `ListAndWatch()` gRPC stream.
+## Related Documentation
+*   **Operational Manuals:** [Troubleshooting Runbook](troubleshooting.md) | [Hands-on Labs Index](hands-on-labs.md) | [Lessons Learned & Post-Mortems](lessons-learned.md)
+*   **Performance Metrics:** [Performance & Scaling Observations](performance.md) | [Roadmap Future Enhancements](roadmap.md)
+*   **Sub-Component Architecture:** [Device Plugin Interface](interview-notes/device-plugin.md) | [GPU Operator Internals](interview-notes/gpu-operator.md) | [Virtualization Models](interview-notes/time-slicing.md) | [Telemetry Metrics](interview-notes/dcgm.md) | [Karpenter Scheduling](interview-notes/karpenter.md)

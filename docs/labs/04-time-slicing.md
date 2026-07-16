@@ -1,42 +1,30 @@
-# Lab 4: Resource Partitioning with GPU Time-Slicing
+# Lab 4: GPU Time Slicing & Sharing Configurations
 
 ## Objective
-Configure GPU Time-Slicing via a custom ConfigMap to partition a single physical GPU into 4 virtual GPU devices. Verify that EKS successfully schedules 4 concurrent pods on the same physical node and explore VRAM and compute isolation trade-offs.
+Configure GPU Time Slicing using a Custom ConfigMap. Validate the logical allocation expansion (e.g. presenting 1 physical GPU as 4 virtual devices) and verify concurrent container executions on the shared accelerator card.
 
 ---
 
 ## Architecture Topology
 
 ```mermaid
-graph TD
-    Sub[Physical GPU - e.g. Tesla T4]
-    TS[NVIDIA Time-Slicing Config]
-    V1[Virtual GPU 0 - 1 Resource unit]
-    V2[Virtual GPU 1 - 1 Resource unit]
-    V3[Virtual GPU 2 - 1 Resource unit]
-    V4[Virtual GPU 3 - 1 Resource unit]
-    P1[Container Pod 1]
-    P2[Container Pod 2]
-    P3[Container Pod 3]
-    P4[Container Pod 4]
-
-    Sub --> TS
-    TS --> V1
-    TS --> V2
-    TS --> V3
-    TS --> V4
-    V1 --> P1
-    V2 --> P2
-    V3 --> P3
-    V4 --> P4
+flowchart LR
+    Physical[Physical GPU: Tesla T4] -->|GPU Time Slicing ConfigMap| Plugin[Kubernetes Device Plugin]
+    Plugin -->|Logical Partitioning| V0[Virtual GPU 0]
+    Plugin -->|Logical Partitioning| V1[Virtual GPU 1]
+    Plugin -->|Logical Partitioning| V2[Virtual GPU 2]
+    Plugin -->|Logical Partitioning| V3[Virtual GPU 3]
+    V0 --> Pod0[Pod 0]
+    V1 --> Pod1[Pod 1]
+    V2 --> Pod2[Pod 2]
+    V3 --> Pod3[Pod 3]
 ```
 
 ---
 
 ## Configuration Reference
 
-### 1. Time-Slicing ConfigMap Definition (`02-platform/karpenter/karpenter-gpu-nodeclass.yaml` or a dedicated manifest)
-This ConfigMap defines the replication factor. Applying this config tells the device plugin to advertise 4 virtual GPU units for every physical GPU discovered.
+### GPU Time Slicing ConfigMap (`02-platform/karpenter/karpenter-gpu-nodeclass.yaml`)
 ```yaml
 apiVersion: v1
 kind: ConfigMap
@@ -51,112 +39,75 @@ data:
         resources:
           - name: nvidia.com/gpu
             replicas: 4
-```
-
-### 2. Referencing the ConfigMap inside `ClusterPolicy`
-Configure the GPU Operator's `devicePlugin` configuration spec to load the ConfigMap:
-```yaml
-spec:
-  devicePlugin:
-    config:
-      name: device-plugin-config
-      default: time-slicing-config
 ```
 
 ---
 
 ## Execution Commands
 
-### 1. Apply Time-Slicing ConfigMap
-```bash
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: device-plugin-config
-  namespace: gpu-operator
-data:
-  time-slicing-config: |-
-    version: v1
-    sharing:
-      timeSlicing:
-        resources:
-          - name: nvidia.com/gpu
-            replicas: 4
-EOF
-```
+*   **Purpose:** Deploy the time-slicing ConfigMap.
+    *   **Command:**
+        ```bash
+        kubectl apply -f 02-platform/karpenter/karpenter-gpu-nodeclass.yaml
+        ```
+    *   **Expected Result:** ConfigMap created in the `gpu-operator` namespace.
+    *   **Validation:** Verify ConfigMap keys: `kubectl describe configmap -n gpu-operator device-plugin-config`
 
-### 2. Patch GPU Operator ClusterPolicy
-Instruct the operator to load the config mapping:
-```bash
-kubectl patch clusterpolicy default --type=merge -p '{"spec":{"devicePlugin":{"config":{"name":"device-plugin-config","default":"time-slicing-config"}}}}'
-```
+*   **Purpose:** Patch the GPU Operator's `ClusterPolicy` to load the sharing configuration.
+    *   **Command:**
+        ```bash
+        kubectl patch clusterpolicy default --type=merge -p '{"spec":{"devicePlugin":{"config":{"name":"device-plugin-config","default":"time-slicing-config"}}}}'
+        ```
+    *   **Expected Result:** ClusterPolicy updates. The Device Plugin daemonset restarts.
+    *   **Validation:** Check restart progress: `kubectl rollout status daemonset/nvidia-device-plugin-daemonset -n gpu-operator`
 
-### 3. Deploy Multi-Pod Workload
-Schedule 4 workload pods requesting 1 GPU each:
-```bash
-kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
-```
-
----
-
-## Expected Output
-Review the status of the node allocatable capacity. A physical single-GPU node (e.g. 1 physical Tesla T4) should now report:
-```text
-Capacity:
-  nvidia.com/gpu: 4
-Allocatable:
-  nvidia.com/gpu: 4
-```
-All 4 workloads should schedule and transition to a `Running` status on the same node:
-```text
-NAME                     READY   STATUS    NODE
-gpu-test-pod-1           1/1     Running   dev-gpu-node-01
-gpu-test-pod-2           1/1     Running   dev-gpu-node-01
-gpu-test-pod-3           1/1     Running   dev-gpu-node-01
-gpu-test-pod-4           1/1     Running   dev-gpu-node-01
-```
+*   **Purpose:** Check advertised GPU capacity.
+    *   **Command:**
+        ```bash
+        kubectl describe node -l accelerator=nvidia-gpu | grep nvidia.com/gpu
+        ```
+    *   **Expected Result:** Node capacity shows `nvidia.com/gpu: 4` (instead of 1).
+    *   **Validation:** Verify allocatable capacity details.
 
 ---
 
 ## Verification Steps
 
-Verify that multiple containers see the same physical GPU hardware details but are separate logical entities:
-```bash
-kubectl exec gpu-test-pod-1 -- nvidia-smi
-kubectl exec gpu-test-pod-2 -- nvidia-smi
-```
-Both outputs will show the identical physical device UUID (indicating shared physical hardware).
+*   **Purpose:** Deploy 4 workloads requesting 1 GPU unit each.
+    *   **Command:**
+        ```bash
+        kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
+        ```
+    *   **Expected Result:** All 4 pods transition to a `Running` status on the same physical node.
+    *   **Validation:** Verify scheduling layout: `kubectl get pods -o wide -l app=gpu-load-test`
 
 ---
 
 ## Cleanup
-Remove the concurrent workloads:
-```bash
-kubectl delete -f 03-workloads/gpu-test-pod-workloads.yaml
-```
+*   **Purpose:** Remove time-slicing configurations and restore default policy.
+    *   **Command:**
+        ```bash
+        kubectl patch clusterpolicy default --type=json -p='[{"op": "remove", "path": "/spec/devicePlugin/config"}]'
+        kubectl delete configmap device-plugin-config -n gpu-operator
+        ```
+    *   **Expected Result:** Device Plugin config resets to default mode.
+    *   **Validation:** Verify node capacity returns to `1`.
 
 ---
 
-> [!NOTE] Engineering Note: Time-Slicing VRAM Risk
-> GPU Time-Slicing multiplexes compute execution time (via round-robin scheduling on the SMs), but it does *not* provide memory (VRAM) isolation. If Container A consumes all available physical VRAM, Container B running on the same card will crash with Out-of-Memory (OOM) errors during memory allocation.
+> [!NOTE] Production Note: No VRAM Isolation
+> GPU Time Slicing partitions compute using a round-robin schedule but does not isolate memory. Any container exceeding its memory limit triggers Out-of-Memory (OOM) errors across all other containers sharing that physical GPU.
 
 ---
 
-## Comparative Analysis: Time-Slicing vs MIG vs MPS
-
-| Feature | GPU Time-Slicing | Multi-Instance GPU (MIG) | Multi-Process Service (MPS) |
-|---|---|---|---|
-| **Mechanism** | Software Context Switching | Hardware Partitioning | Proxy Server Consolidation |
-| **VRAM Isolation** | **None** (Shared Globally) | **Strict** (Physical Slices) | Software-enforced limits |
-| **Compute Isolation**| Temporal (Wait queues) | Dedicated SM blocks | Managed SM share limits |
-| **Typical Use Case** | Small utility or debug pods | Multi-tenant H100 partitions | High-throughput API Serving |
+## Trade-offs
+*   **Pros (Density & Cost):** Dramatically increases hardware utilization and reduces idle compute costs for lightweight workloads.
+*   **Cons (No Memory Boundaries):** Lacks hardware-level memory boundaries. One pod leaking memory can crash all other pods sharing the card.
+*   **Cons (Compute Latency):** Round-robin driver-level context switching adds a **15-25% execution latency penalty** for heavy compute workloads.
 
 ---
 
-## Interview Takeaways
-
-*   **ホワイトボード: Explain Time-Slicing Scheduling Limitations:**
-    *   Explain that Time-Slicing does not run tasks in parallel. The GPU driver context-switches compute processes sequentially. While Pod A executes a kernel, Pod B's execution is queued. This introduces latency overhead under heavy concurrency.
-*   **VRAM Overcommit Dangers:** Highlight that time-slicing is not safe for untrusted multi-tenant applications. Since memory is not isolated, a memory leak or oversized model loading in one pod will crash all other pods sharing that physical GPU.
-*   **MIG Comparison:** MIG provides hard physical limits (VRAM, cache, and SM lines are split at the silicon level), but it is restricted to enterprise architectures (Ampere/Hopper like A100/H100/A30) and limits partitions to set configs (e.g. 7 instances). Time-Slicing is free, runs on all architectures (T4, A10G), and scales partitions arbitrarily.
+## Related Documentation
+*   **Core Systems:** [Architecture Topology](../architecture.md) | [Troubleshooting Runbook](../troubleshooting.md) | [Performance Profiling](../performance.md)
+*   **Detailed Labs:** [01: Provisioning](01-gpu-node-provisioning.md) | [02: GPU Operator](02-gpu-operator.md) | [03: Device Plugin](03-device-plugin.md) | [05: Observability](05-dcgm-observability.md) | [06: Troubleshooting](06-production-troubleshooting.md)
+*   **Journal Logs:** [Post-Mortems & Lessons Learned](../lessons-learned.md)

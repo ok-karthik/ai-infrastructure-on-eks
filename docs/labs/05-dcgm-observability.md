@@ -1,7 +1,7 @@
-# Lab 5: Hardware Observability & Telemetry with DCGM & Prometheus
+# Lab 5: DCGM Observability Pipeline
 
 ## Objective
-Establish a high-resolution observability pipeline to scrape hardware-level GPU telemetry. Deploy the DCGM Exporter DaemonSet, scrape device-level performance signals via Prometheus, visualize metrics on Grafana dashboards, and establish operational alert thresholds.
+Establish a telemetry monitoring pipeline. Deploy the DCGM Exporter to extract low-level hardware metrics, configure Prometheus scrapers with 5s collection intervals, and expose performance dashboards in Grafana.
 
 ---
 
@@ -9,99 +9,97 @@ Establish a high-resolution observability pipeline to scrape hardware-level GPU 
 
 ```mermaid
 graph LR
-    GPU[GPU Registers] -->|Sensors / NVML| DCGM[DCGM Daemon]
-    DCGM -->|Port 9400 /metrics| Exporter[DCGM Exporter Pod]
-    Prom[Prometheus Scraper] -->|HTTP GET Scrape| Exporter
-    Prom -->|TSDB Query| Grafana[Grafana Dashboards]
+    GPU[NVIDIA GPU Card] -->|NVML driver hooks| DCGM[DCGM Exporter pod:9400]
+    Prom[Prometheus Scraper] -->|Scrapes metrics at 5s intervals| DCGM
+    Grafana[Grafana Dashboard] -->|Queries| Prom
 ```
 
 ---
 
-## Technical Metric Registry
+## Configuration Reference
 
-Unlike CPU/Memory metrics which are tracked by the OS, GPU metrics must be scraped from the GPU's internal microcontrollers using the Data Center GPU Manager (DCGM) engine.
-
-| Metric | Name | Interpretation | Warning Alert | Critical Alert |
-|---|---|---|---|---|
-| **SM Occupancy** | `DCGM_FI_DEV_GPU_UTIL` | Streaming Multiprocessor compute units busy state (%) | < 10% (Idle Node) | N/A |
-| **VRAM Consumption** | `DCGM_FI_DEV_FB_USED` | Frame Buffer (VRAM) size currently in use (MB) | > 85% VRAM Load | > 95% (OOM Danger) |
-| **Electrical Draw** | `DCGM_FI_DEV_POWER_USAGE` | Real-time electrical consumption (Watts) | N/A | > TDP Max Cap |
-| **Temperature** | `DCGM_FI_DEV_GPU_TEMP` | GPU core temperature (Celsius) | > 80°C | > 85°C (Throttling) |
-| **SM Clock Rate** | `DCGM_FI_DEV_SM_CLOCK` | Current execution clock speed (MHz) | N/A | Throttling Drop |
+### Exporter Service Monitor Configuration (`02-platform/monitoring/prometheus-grafana.yaml`)
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nvidia-dcgm-exporter
+  endpoints:
+    - port: metrics
+      interval: 5s
+```
 
 ---
 
 ## Execution Commands
 
-### 1. Deploy the Monitoring Stack (Prometheus & Grafana)
-Deploy the local observability instances:
-```bash
-kubectl apply -f 02-platform/monitoring/prometheus-grafana.yaml
-```
+*   **Purpose:** Deploy the Prometheus and Grafana monitoring stacks.
+    *   **Command:**
+        ```bash
+        kubectl apply -f 02-platform/monitoring/prometheus-grafana.yaml
+        ```
+    *   **Expected Result:** Monitoring namespaces, deployments, and services initialized.
+    *   **Validation:** Verify running pods: `kubectl get pods -n monitoring`
 
-### 2. Verify DCGM Service Discovery
-Confirm that the DCGM Exporter service exposes the metrics port:
-```bash
-kubectl get svc -n gpu-operator -l app.kubernetes.io/name=nvidia-dcgm-exporter
-```
+*   **Purpose:** Query the exporter endpoint directly from the node.
+    *   **Command:**
+        ```bash
+        kubectl exec -n gpu-operator ds/nvidia-dcgm-exporter -- curl -s localhost:9400/metrics | grep "dcgm_sm_copy"
+        ```
+    *   **Expected Result:** Active Prometheus-formatted metrics logs returned.
+    *   **Validation:** Confirm lines containing active metric values are present.
 
-### 3. Fetch Raw Exporter Telemetry
-Run a validation curl check against the metrics endpoint from inside the cluster:
-```bash
-kubectl run curl-monitor --image=curlimages/curl -i --rm --restart=Never -- \
-  curl -s http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics | grep DCGM_
-```
-
----
-
-## Expected Output
-A stream of Prometheus metric lines:
-```text
-# HELP DCGM_FI_DEV_GPU_UTIL GPU Utilization (in %).
-# TYPE DCGM_FI_DEV_GPU_UTIL gauge
-DCGM_FI_DEV_GPU_UTIL{gpu="0", UUID="GPU-70e2...",device="nvidia0",modelName="Tesla T4",container="cuda-test",namespace="default",pod="gpu-test-pod"} 92
-# HELP DCGM_FI_DEV_FB_USED Framebuffer memory used (in MiB).
-# TYPE DCGM_FI_DEV_FB_USED gauge
-DCGM_FI_DEV_FB_USED{gpu="0", UUID="GPU-70e2...",device="nvidia0",modelName="Tesla T4",container="cuda-test",namespace="default",pod="gpu-test-pod"} 4210
-```
+*   **Purpose:** Access the Grafana web interface.
+    *   **Command:**
+        ```bash
+        kubectl port-forward svc/grafana-service -n monitoring 3000:3000
+        ```
+    *   **Expected Result:** Local port mapping active on port 3000.
+    *   **Validation:** Navigate to `http://localhost:3000` to verify login prompt.
 
 ---
 
 ## Verification Steps
 
-### 1. View Prometheus Targets
-Check if Prometheus successfully discovers and scrapes the exporter:
-```bash
-# Port forward Prometheus UI
-kubectl port-forward svc/prometheus-service 9090:9090 &
-```
-Browse to `http://localhost:9090/targets` and confirm that `dcgm-exporter` is listed as `UP`.
-
-### 2. Verify Grafana Visualizations
-```bash
-# Port forward Grafana UI
-kubectl port-forward svc/grafana-service 3000:3000 &
-```
-Browse to `http://localhost:3000` (Access credentials: `admin / admin`). Open the GPU Dashboard and verify graphs populate for SM Load and Temp.
+*   **Purpose:** Run a workload and monitor SM spikes.
+    *   **Command:**
+        ```bash
+        kubectl apply -f 03-workloads/gpu-test-deployment.yaml
+        ```
+    *   **Expected Result:** Workload schedules, starts execution, and outputs metrics.
+    *   **Validation:** In Grafana, verify the "SM Utilization" panel registers workload spikes.
 
 ---
 
 ## Cleanup
-Terminate the background port-forwarding processes:
-```bash
-kill $(jobs -p)
-```
+*   **Purpose:** Uninstall the monitoring stack.
+    *   **Command:**
+        ```bash
+        kubectl delete -f 02-platform/monitoring/prometheus-grafana.yaml
+        ```
+    *   **Expected Result:** Telemetry services terminated.
+    *   **Validation:** Confirm namespace removal: `kubectl get ns monitoring`
 
 ---
 
-> [!NOTE] Engineering Note: DCGM Metric Resolution
-> DCGM measures hardware registers directly, not Kubernetes scheduling decisions. If you use GPU Time-Slicing, DCGM metrics like `DCGM_FI_DEV_GPU_UTIL` and `DCGM_FI_DEV_GPU_TEMP` remain device-wide. You cannot calculate independent per-pod GPU utilization because the hardware SM engine does not distinguish container namespaces.
+> [!NOTE] Production Note: High-Resolution Scraping
+> GPU workloads execute in transient bursts. CPU-level metrics (scraped every 30s) miss these spikes. Set the DCGM Exporter scrape interval to 5s to ensure accuracy.
 
 ---
 
-## Interview Takeaways
+## Common Failure Modes
+*   **Scraper Port Blockage:** Security group rules block traffic on port 9400. Ensure internal cluster routing permits Prometheus access.
+*   **Socket Read Failures:** Exporter crashes if the NVML socket `/var/run/nvidia-topologyd` becomes unresponsive. Restarting the driver container resolves this loop.
+*   **Namespace Metric Collisions:** Under GPU Time Slicing, DCGM binds resource metrics to the physical GPU UUID. This can cause pod-level metrics to overlap or report inconsistently.
 
-*   **ホワイトボード: Discussing Production Alerting Rules:**
-    *   Explain how to configure alerting on thermal or clock violations. If `dcgm_clock_throttle_reasons` matches a bitmask for thermal throttling (indicating the clock dropped to cool the card), it represents an infrastructure cooling failure.
-*   **XID Error Code Monitoring:** Discuss that scraping `dcgm_xid_errors` is the most critical alerting signal. Any value greater than 0 represents a driver/hardware crash. For instance, XID 31 indicates memory page faults, while XID 45 indicates a PCIe link loss which takes the node down.
-*   **Scrape Interval Trade-offs:** Explain that GPU workloads scale rapidly. Standard 30s scrape intervals smooth out transient GPU load spikes, making it look underutilized. For machine learning models, scrape intervals should be reduced to 5 seconds to capture peak load events.
+---
+
+## Related Documentation
+*   **Core Systems:** [Architecture Topology](../architecture.md) | [Troubleshooting Runbook](../troubleshooting.md) | [Performance Profiling](../performance.md)
+*   **Detailed Labs:** [01: Provisioning](01-gpu-node-provisioning.md) | [02: GPU Operator](02-gpu-operator.md) | [03: Device Plugin](03-device-plugin.md) | [04: Time-Slicing](04-time-slicing.md) | [06: Troubleshooting](06-production-troubleshooting.md)
+*   **Journal Logs:** [Post-Mortems & Lessons Learned](../lessons-learned.md)

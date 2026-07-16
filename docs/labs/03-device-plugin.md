@@ -1,7 +1,7 @@
-# Lab 3: Hardware Resource Advertisement with the NVIDIA Device Plugin
+# Lab 3: Validate the Kubernetes Device Plugin Interface
 
 ## Objective
-Investigate the runtime operations of the NVIDIA Device Plugin. Examine the gRPC service contract (`Register`, `ListAndWatch`, `Allocate`), verify how Kubelet registers the resources as Extended Resources, and trace host device node mapping (`/dev/nvidia*`) inside running container namespaces.
+Verify the registration and communication lifecycle of the Kubernetes Device Plugin. Validate the host socket registration call, resource advertisement metrics, and runtime device identifier mounts.
 
 ---
 
@@ -9,107 +9,95 @@ Investigate the runtime operations of the NVIDIA Device Plugin. Examine the gRPC
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant Kubelet as Kubelet Daemon
-    participant Plugin as NVIDIA Device Plugin
-    participant Host as Host Linux OS
-    participant CR as Container Runtime (CRI)
-
-    Plugin->>Kubelet: Call Register() via UNIX Socket
-    Kubelet-->>Plugin: Connection established
-    Plugin->>Kubelet: Stream device UUID lists via ListAndWatch()
-    Kubelet->>Kubelet: Update Node Extended Resources (nvidia.com/gpu)
-    Note over Kubelet: Pod scheduled requesting GPU
-    Kubelet->>Plugin: Call Allocate(Requested UUIDs)
-    Plugin-->>Kubelet: Return device paths & environment variables
-    Kubelet->>CR: Pass Spec details (Devices: /dev/nvidia0)
-    CR->>Host: Mount device files into container namespace
+    participant Kubelet as Host Kubelet
+    participant plugin as Device Plugin Pod
+    participant API as K8s API Server
+    
+    plugin->>Kubelet: Register() via UNIX socket (kubelet.sock)
+    plugin->>Kubelet: ListAndWatch() gRPC stream (exposes device status)
+    Kubelet->>API: Advertise allocatable capacity (nvidia.com/gpu: 1)
+    Kubelet->>plugin: Allocate() device UUIDs during Pod binding
+    plugin-->>Kubelet: Return environment variables & mounts
 ```
 
 ---
 
-## Technical Concept Deep-Dive
+## Configuration Reference
 
-### 1. Extended Resources
-Kubernetes only tracks CPU, Memory, and Ephemeral Storage natively. Any other custom hardware (like GPUs or FPGAs) must be registered as **Extended Resources** (`nvidia.com/gpu`).
-*   **Integer Math:** Extended Resources are tracked as integer quantities. The scheduler enforces resource availability based on node capacity decrements.
-*   **No Overcommit:** Unlike CPU, extended resources cannot be overcommitted.
-
-### 2. Kubelet Device Manager Checkpointing
-The Kubelet process maintains a local database file (`/var/lib/kubelet/device-plugins/kubelet_internal_checkpoint`) to track which container is allocated to which specific GPU physical index (UUID). If Kubelet restarts, it reads this file to reconstruct active device assignments.
+### Kubelet Socket Endpoint Location
+The plugin targets the host path UNIX socket for communication:
+```yaml
+volumeMounts:
+  - name: device-plugin
+    mountPath: /var/lib/kubelet/device-plugins
+```
 
 ---
 
 ## Execution Commands
 
-### 1. Inspect Device Plugin Logs
-Review the registration loop output of the Device Plugin:
-```bash
-kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset --tail=50
-```
+*   **Purpose:** Verify Device Plugin pod execution.
+    *   **Command:**
+        ```bash
+        kubectl get pods -n gpu-operator -l app=nvidia-device-plugin-daemonset
+        ```
+    *   **Expected Result:** Container reports `Running`.
+    *   **Validation:** Check event logs if stuck in initialization.
 
-### 2. Verify Node Extended Resource Capacity
-Examine if the node successfully advertises `nvidia.com/gpu` capacity to EKS:
-```bash
-kubectl describe node -l accelerator=nvidia-gpu | grep -A 5 -E "Capacity|Allocatable"
-```
+*   **Purpose:** Check registration handshake output.
+    *   **Command:**
+        ```bash
+        kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset --tail=50
+        ```
+    *   **Expected Result:** Logs indicating `Register()` and `ListAndWatch()` gRPC streams are active.
+    *   **Validation:** Verify registration socket connects successfully.
 
-### 3. Trace Container Namespace Mounts
-Verify that a running GPU container has host character device nodes mounted. Boot a test container and run an execution check:
-```bash
-# Verify character devices exist inside container
-kubectl run device-check --image=nvidia/cuda:12.0.0-base-ubuntu20.04 \
-  --restart=Never --limits="nvidia.com/gpu=1" -- \
-  ls -la /dev/ | grep nvidia
-```
-
----
-
-## Expected Output
-Log output from the validation container:
-```text
-crw-rw-rw-  1 root root 195,   0 Jul 15 20:30 nvidia0
-crw-rw-rw-  1 root root 195, 255 Jul 15 20:30 nvidiactl
-crw-rw-rw-  1 root root 195, 254 Jul 15 20:30 nvidia-uvm
-```
+*   **Purpose:** Verify EKS Node Capacity.
+    *   **Command:**
+        ```bash
+        kubectl describe node -l accelerator=nvidia-gpu | grep -A 5 "Allocatable"
+        ```
+    *   **Expected Result:** `nvidia.com/gpu` capacity is advertised.
+    *   **Validation:** Check capacity values.
 
 ---
 
 ## Verification Steps
 
-### 1. Confirm Checkpoint State
-Verify Kubelet is actively tracking device plugins by verifying active UNIX socket endpoints on the host filesystem:
-```bash
-# Command executed on the host node
-ls -la /var/lib/kubelet/device-plugins/
-```
-Expected output:
-```text
-srwxr-xr-x 1 root root 0 Jul 15 20:10 kubelet.sock
-srwxr-xr-x 1 root root 0 Jul 15 20:15 nvidia-gpu.sock
--rw-r--r-- 1 root root 402 Jul 15 20:15 kubelet_internal_checkpoint
-```
+*   **Purpose:** Run a CUDA matrix multiplier to confirm allocation environment mapping.
+    *   **Command:**
+        ```bash
+        kubectl apply -f 03-workloads/gpu-test-deployment.yaml
+        ```
+    *   **Expected Result:** Pod binds, launches, and performs calculations.
+    *   **Validation:** Execute `kubectl exec <pod-name> -- env | grep NVIDIA_VISIBLE_DEVICES` to verify mapped hardware UUIDs.
 
 ---
 
 ## Cleanup
-Remove the test check pod:
-```bash
-kubectl delete pod device-check
-```
+*   **Purpose:** Delete the verification deployment.
+    *   **Command:**
+        ```bash
+        kubectl delete -f 03-workloads/gpu-test-deployment.yaml
+        ```
+    *   **Expected Result:** Containers terminated.
+    *   **Validation:** Check pod listing status.
 
 ---
 
-> [!NOTE] Engineering Note: Device Plugin Allocation Limits
-> The Device Plugin acts as an registry and allocator, but it *does not mount* the physical hardware files into the container. Kubelet receives the device targets from the plugin's `Allocate` return payload and instructs the container runtime (e.g. containerd) to mount the device nodes (`/dev/nvidia*`) and restrict namespace namespaces via cgroups.
+> [!NOTE] Production Note: Capacity Scarcity
+> Kubelet zero-allocates capacity if the device plugin experiences connection timeouts or socket permission blockages. Monitor socket communication errors closely.
 
 ---
 
-## Interview Takeaways
+## Operational Notes
+*   **Socket Path Access:** Ensure host path mounts have root directory write capabilities. Selinux or AppArmor profiles blocking UNIX socket access are common root causes of connection failures.
+*   **Unhealthy Device Exclusions:** The Device Plugin automatically excludes faulty GPUs from the allocatable pool if `ListAndWatch` reports hardware errors, preventing silent workload corruption.
+*   **Environment Mappings:** Workload isolation relies on the plugin injecting `NVIDIA_VISIBLE_DEVICES` to container namespaces. Ensure security contexts allow container runtime hooks to apply these rules.
 
-*   **ホワイトボード: Explain Register → ListAndWatch → Allocate:**
-    *   **Register:** Device plugin registers its resource identifier (`nvidia.com/gpu`) and UNIX socket path.
-    *   **ListAndWatch:** The plugin keeps a gRPC stream open to notify Kubelet of device list changes and health statuses.
-    *   **Allocate:** The scheduler assigns the pod. Kubelet calls the plugin, which translates UUID selections into physical host device mounts and environment injection specs.
-*   **Host Character Devices:** Be prepared to list critical character device files: `/dev/nvidiactl` (control commands), `/dev/nvidia-uvm` (unified memory driver access), and `/dev/nvidia[0-7]` (specific physical GPU slots).
-*   **State Recovery:** Explain that Kubelet relies on `/var/lib/kubelet/device-plugins/kubelet_internal_checkpoint` to recover allocations after a Kubelet restart. If this file is corrupted, Kubelet may double-allocate GPUs, causing runtime CUDA errors.
+---
+
+## Related Documentation
+*   **Core Systems:** [Architecture Topology](../architecture.md) | [Troubleshooting Runbook](../troubleshooting.md) | [Performance Profiling](../performance.md)
+*   **Detailed Labs:** [01: Provisioning](01-gpu-node-provisioning.md) | [02: GPU Operator](02-gpu-operator.md) | [04: Time-Slicing](04-time-slicing.md) | [05: Observability](05-dcgm-observability.md) | [06: Troubleshooting](06-production-troubleshooting.md)
+*   **Journal Logs:** [Post-Mortems & Lessons Learned](../lessons-learned.md)

@@ -1,7 +1,7 @@
-# Lab 2: Automated GPU Lifecycle with the NVIDIA GPU Operator
+# Lab 2: Automated GPU Lifecycle with the GPU Operator
 
 ## Objective
-Install and configure the NVIDIA GPU Operator via Helm. Validate that the operator successfully detects GPU hardware labels on Karpenter-provisioned nodes, triggers the dynamic compilation and loading of drivers, sets up the container toolkit runtime class, and completes vector validation.
+Install and configure the GPU Operator via Helm. Validate that the operator detects hardware capability labels on Karpenter-provisioned nodes, compiles and loads driver components, sets up the runtime class, and completes validation routines.
 
 ---
 
@@ -9,11 +9,11 @@ Install and configure the NVIDIA GPU Operator via Helm. Validate that the operat
 
 ```mermaid
 graph TD
-    Node[EKS Worker Node] -->|1. Label: feature.node.kubernetes.io/pci-10de.present| Op[GPU Operator]
-    Op -->|2. Schedules DaemonSet| Driver[NVIDIA Driver Container]
-    Driver -->|3. Compiles & Loads Module| Host[Host Linux Kernel]
-    Host -->|4. Configures containerd| Toolkit[NVIDIA Container Toolkit]
-    Toolkit -->|5. Runs CUDA Tests| Val[Validator Pod]
+    Node[EKS Worker Node] -->|Label discovery| Op[GPU Operator]
+    Op -->|Schedules DaemonSet| Driver[NVIDIA Driver Container]
+    Driver -->|Loads Module| Host[Host Linux Kernel]
+    Host -->|Configures containerd| Toolkit[NVIDIA Container Toolkit]
+    Toolkit -->|Runs CUDA Tests| Val[Validator Pod]
 ```
 
 ---
@@ -22,14 +22,13 @@ graph TD
 
 ### GPU Driver Delivery Modes
 The GPU Operator can manage drivers in two main ways, configured inside the `ClusterPolicy` Custom Resource:
-1.  **Dynamic Kernel Compilation (Default):** The operator schedules a compiler container (`nvidia-driver-daemonset`) containing GCC and kernel header packages. The container compiles the driver module (`nvidia.ko`) against the host's active kernel version and inserts it.
-2.  **Pre-Installed / Pre-Baked Mode:** If the host AMI already has the drivers compiled and pre-loaded (such as when using the official AWS EKS-optimized AL2023 GPU AMI), the Operator's driver installation stage is bypassed, and it immediately proceeds to configure the Container Toolkit and Device Plugin.
+1.  **Dynamic Kernel Compilation:** The operator compiles the driver module (`nvidia.ko`) against the host's active kernel version dynamically at node startup.
+2.  **Pre-Installed Mode:** If drivers are pre-baked into the node AMI (e.g. using the official AWS EKS-optimized AL2023 GPU AMI), the Operator's driver installation stage is bypassed.
 
 ```yaml
-# Snippet of ClusterPolicy configuration for pre-installed drivers
 spec:
   driver:
-    enabled: false # Disables the driver installer DaemonSet; assumes host drivers are active
+    enabled: false # Bypasses dynamic compiler and module load; assumes host drivers are active
   toolkit:
     enabled: true
   devicePlugin:
@@ -40,87 +39,68 @@ spec:
 
 ## Execution Commands
 
-### 1. Register NVIDIA Helm Repository
-```bash
-helm repo add nvidia https://helm.ngc.nvidia.com/nvidia-dev
-helm repo update
-```
+*   **Purpose:** Register the NVIDIA Helm repository.
+    *   **Command:**
+        ```bash
+        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia-dev && helm repo update
+        ```
+    *   **Expected Result:** Remote charts repository database updated.
+    *   **Validation:** Verify registry output.
 
-### 2. Install the GPU Operator
-Deploy the GPU Operator to its own namespace:
-```bash
-helm install gpu-operator nvidia/gpu-operator \
-  --namespace gpu-operator \
-  --create-namespace \
-  --version v24.3.0
-```
+*   **Purpose:** Install the GPU Operator.
+    *   **Command:**
+        ```bash
+        helm install gpu-operator nvidia/gpu-operator -n gpu-operator --create-namespace --version v24.3.0
+        ```
+    *   **Expected Result:** Daemonsets and CRDs deployed.
+    *   **Validation:** Check active pods: `kubectl get pods -n gpu-operator`
 
-### 3. Track ClusterPolicy Reconciliation
-The GPU Operator configures components according to the custom `ClusterPolicy` resource named `default`. Monitor the reconciliation progress:
-```bash
-kubectl get clusterpolicy default -w
-```
-
----
-
-## Expected Output
-Running `kubectl get pods -n gpu-operator` should show the initialized daemon layers:
-```text
-NAME                                                  READY   STATUS      RESTARTS   AGE
-gpu-operator-6b7dfbfd5-xxxx                           1/1     Running     0          5m
-nvidia-driver-daemonset-xxxx                          1/1     Running     0          4m
-nvidia-container-toolkit-daemonset-xxxx               1/1     Running     0          3m
-nvidia-device-plugin-daemonset-xxxx                   1/1     Running     0          2m
-nvidia-operator-validator-xxxx                        0/1     Completed   0          1m
-```
+*   **Purpose:** Track ClusterPolicy reconciliation progress.
+    *   **Command:**
+        ```bash
+        kubectl get clusterpolicy default -w
+        ```
+    *   **Expected Result:** Policy status transitions to `Ready`.
+    *   **Validation:** Verify that all validation jobs run and exit cleanly.
 
 ---
 
 ## Verification Steps
 
-### 1. Inspect Driver Load Status
-Exec into the driver container to verify host driver communication:
-```bash
-kubectl exec -n gpu-operator ds/nvidia-driver-daemonset -- nvidia-smi
-```
-Expected output:
-```text
-+-----------------------------------------------------------------------------------------+
-| NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: 12.4     |
-|-----------------------------------------+------------------------+----------------------+
-| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
-| Fan  Temp   Perf          Pwr:Usage/Cap |          Memory-Usage  | GPU-Util  Compute M. |
-|                                         |                        |               MIG M. |
-|=========================================+========================+======================|
-|   0  Tesla T4                       On  | 00000000:00:1E.0   Off |                    0 |
-| N/A   35C    P8             9W /  70W   |      0MiB / 15360MiB   |      0%      Default |
-|                                         |                        |                  N/A |
-+-----------------------------------------+------------------------+----------------------+
-```
-
-### 2. Verify Operator Validation Results
-Verify that the `nvidia-operator-validator` pods have successfully executed their checks and exited:
-```bash
-kubectl get pods -n gpu-operator -l app=nvidia-operator-validator
-```
+*   **Purpose:** Verify host driver communication status.
+    *   **Command:**
+        ```bash
+        kubectl exec -n gpu-operator ds/nvidia-driver-daemonset -- nvidia-smi
+        ```
+    *   **Expected Result:** GPU performance report showing device details, driver versions, and SM load.
+    *   **Validation:** Check memory utilization lists.
 
 ---
 
 ## Cleanup
-If you need to uninstall the operator stack:
-```bash
-helm uninstall gpu-operator -n gpu-operator
-```
+*   **Purpose:** Uninstall the operator deployment.
+    *   **Command:**
+        ```bash
+        helm uninstall gpu-operator -n gpu-operator
+        ```
+    *   **Expected Result:** Cleanup of all GPU Operator daemons.
+    *   **Validation:** Confirm namespace is empty: `kubectl get pods -n gpu-operator`
 
 ---
 
-> [!NOTE] Engineering Note: Container Toolkit Injection
-> The NVIDIA Container Toolkit does not compile workloads. It patches containerd's `/etc/containerd/config.toml` to register an OCI runtime hook. When a pod requesting GPU capacity starts, the hook intercepts the sandbox creation and binds host-level NVIDIA libraries (`libcuda.so`) and device character interfaces (`/dev/nvidia*`) directly into the container namespace.
+> [!NOTE] Production Note: Container Runtime Restart
+> The NVIDIA Container Toolkit patchescontaind's configuration. The restart of the container runtime (containerd) is brief but momentarily interrupts active CRI communications on the node.
 
 ---
 
-## Interview Takeaways
+## Production Considerations
+*   **Pre-baked Drivers for Speed:** Avoid compiling drivers at boot time in production. Use pre-baked GPU AMIs to reduce node bootstrap latency by 30 seconds.
+*   **Version Pinning:** Pin the `ClusterPolicy` and Helm chart versions strictly to prevent automatic driver upgrades from triggering cluster-wide node interruptions.
+*   **Resource Caps:** Enforce CPU/Memory limits on driver compile containers to prevent host-level resource exhaustion during scaling events.
 
-*   **Operator Value Proposition:** Explain that the GPU Operator automates the operational steps required to prepare a bare Linux node to run GPU workloads, including kernel driver compilation, runtime configurations, and hardware health checks.
-*   **Whiteboarding Driver Compilation vs Pre-Baked:** Be ready to discuss the trade-offs of dynamic compilation (flexible across node AMIs but slow and dependent on external packages) vs pre-baked drivers (fast node boot times, highly secure private subnets, but tied to specific AMI versions).
-*   **Validator Workflow:** Explain that the operator uses validator pods to run sanity tests (e.g. testing host driver connection and performing vector addition via CUDA) before making the node available to customer applications.
+---
+
+## Related Documentation
+*   **Core Systems:** [Architecture Topology](../architecture.md) | [Troubleshooting Runbook](../troubleshooting.md) | [Performance Profiling](../performance.md)
+*   **Detailed Labs:** [01: Provisioning](01-gpu-node-provisioning.md) | [03: Device Plugin](03-device-plugin.md) | [04: Time-Slicing](04-time-slicing.md) | [05: Observability](05-dcgm-observability.md) | [06: Troubleshooting](06-production-troubleshooting.md)
+*   **Journal Logs:** [Post-Mortems & Lessons Learned](../lessons-learned.md)
