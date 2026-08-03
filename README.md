@@ -1,180 +1,284 @@
 # AI Infrastructure Platform on Amazon EKS
 
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-v1.30-blue.svg?logo=kubernetes&style=flat-square)](https://kubernetes.io/)
-[![Terraform](https://img.shields.io/badge/Terraform-v1.8+-purple.svg?logo=terraform&style=flat-square)](https://www.terraform.io/)
-[![NVIDIA](https://img.shields.io/badge/NVIDIA-GPU%20Operator-green.svg?logo=nvidia&style=flat-square)](https://github.com/NVIDIA/gpu-operator)
-[![Karpenter](https://img.shields.io/badge/Karpenter-v1.13-orange.svg?style=flat-square)](https://karpenter.sh/)
-[![GitOps](https://img.shields.io/badge/GitOps-Argo%20CD-red.svg?logo=argo&style=flat-square)](https://argoproj.github.io/argo-cd/)
+[![Terraform](https://img.shields.io/badge/Terraform-1.5+-purple.svg?logo=terraform&style=flat-square)](https://www.terraform.io/)
+[![Kubernetes](https://img.shields.io/badge/EKS-1.35-blue.svg?logo=kubernetes&style=flat-square)](https://kubernetes.io/)
+[![Karpenter](https://img.shields.io/badge/Karpenter-1.13-orange.svg?style=flat-square)](https://karpenter.sh/)
+[![GPU Operator](https://img.shields.io/badge/NVIDIA%20GPU%20Operator-v26.3-green.svg?logo=nvidia&style=flat-square)](https://github.com/NVIDIA/gpu-operator)
+[![Argo CD](https://img.shields.io/badge/Argo%20CD-10.2-red.svg?logo=argo&style=flat-square)](https://argoproj.github.io/argo-cd/)
+[![CI](https://github.com/ok-karthik/ai-infrastructure-on-eks/actions/workflows/ci.yml/badge.svg)](https://github.com/ok-karthik/ai-infrastructure-on-eks/actions/workflows/ci.yml)
 
-A production-ready blueprint for an EKS-based AI Infrastructure Platform, optimized for provisioning, scaling, partitioning, and observing NVIDIA GPU workloads.
+Terraform-provisioned EKS platform for running GPU workloads: Karpenter provisions
+Spot GPU nodes on demand, the NVIDIA GPU Operator makes the hardware schedulable,
+time slicing lets several pods share one card, and DCGM exports the telemetry.
+
+Built to learn the GPU-on-Kubernetes stack end to end and validated on real
+`g4dn.xlarge` Spot instances in `us-east-1`.
 
 ---
 
-## Architecture Topology
+## The problem this solves
 
-The platform separates responsibilities into four distinct layers (Infrastructure, Platform, Runtime, and Observability):
+A GPU instance that joins a Kubernetes cluster is not usable by Kubernetes. The
+kubelet advertises CPU and memory; it knows nothing about an NVIDIA card until
+something loads the kernel driver, wires the NVIDIA runtime into containerd, and
+runs a device plugin that registers `nvidia.com/gpu` over gRPC. And a GPU node
+that sits idle costs roughly 15x what a general-purpose node costs.
+
+This repository wires up both halves: making GPUs schedulable, and making sure
+you only pay for them while something is actually running.
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Infrastructure ["1. Infrastructure Layer (Terraform)"]
-        AWS[AWS VPC Network] --> EKS[Amazon EKS Cluster]
+    subgraph Infra ["1. Infrastructure (Terraform)"]
+        VPC[VPC: 3 private + 2 public subnets, NAT] --> EKS[EKS Control Plane]
+        EKS --> MNG[Managed Node Group<br/>1x t3.small Spot, controllers only]
     end
 
-    subgraph Platform ["2. Platform Control Layer (Helm / Argo CD)"]
-        Karpenter[Karpenter Autoscaler]
-        ArgoCD[Argo CD GitOps Engine]
-        EKS --> Karpenter
-        EKS --> ArgoCD
+    subgraph Platform ["2. Platform (Helm via Terraform)"]
+        Karpenter[Karpenter<br/>Pod Identity + scoped IAM]
+        ArgoCD[Argo CD]
+        MNG --> Karpenter
+        MNG --> ArgoCD
     end
 
-    subgraph Runtime ["3. Hardware Runtime Layer (GPU Operator)"]
-        GPUOp[GPU Operator]
-        Driver[Kernel Drivers]
-        Toolkit[NVIDIA Container Toolkit]
-        DevPlugin[Kubernetes Device Plugin]
-        TimeSlicing[GPU Time Slicing Config]
-        CUDA[CUDA Matrix Workload]
+    subgraph Runtime ["3. GPU Runtime (GPU Operator)"]
+        GPUNode[g4dn.xlarge Spot<br/>EKS NVIDIA-optimized AMI]
+        NFD[Node Feature Discovery]
+        DevPlugin[Device Plugin<br/>advertises nvidia.com/gpu]
+        Slice[Time Slicing<br/>1 card -> 4 slices]
 
-        Karpenter -->|Provisions Node| GPUOp
-        GPUOp --> Driver
-        Driver --> Toolkit
-        Toolkit --> DevPlugin
-        DevPlugin --> TimeSlicing
-        TimeSlicing --> CUDA
+        Karpenter -->|provisions on pending pod| GPUNode
+        GPUNode --> NFD
+        NFD --> DevPlugin
+        DevPlugin --> Slice
     end
 
-    subgraph Observability ["4. Observability Stack (DCGM Exporter / Prom)"]
-        DCGM[DCGM Exporter]
-        Prometheus[Prometheus Metrics Engine]
-        Grafana[Grafana Dashboard]
+    subgraph Obs ["4. Observability"]
+        DCGM[DCGM Exporter :9400]
+        Prom[Prometheus<br/>5s scrape, per-pod SD]
+        Graf[Grafana]
 
-        CUDA --> DCGM
-        DCGM --> Prometheus
-        Prometheus --> Grafana
+        Slice --> DCGM
+        DCGM --> Prom
+        Prom --> Graf
     end
 
-    style Infrastructure fill:#2a3a5c,stroke:#fff,stroke-width:1px,color:#fff
+    style Infra fill:#2a3a5c,stroke:#fff,stroke-width:1px,color:#fff
     style Platform fill:#3a4b6c,stroke:#fff,stroke-width:1px,color:#fff
     style Runtime fill:#1e4c3a,stroke:#fff,stroke-width:1px,color:#fff
-    style Observability fill:#4c2c2c,stroke:#fff,stroke-width:1px,color:#fff
+    style Obs fill:#4c2c2c,stroke:#fff,stroke-width:1px,color:#fff
 ```
 
-*For detailed component relationships and structural breakdowns, see [docs/architecture.md](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/architecture.md).*
+See [docs/architecture.md](docs/architecture.md) for component-level detail.
 
 ---
 
-## What this platform demonstrates
+## What it does
 
-*   **Provision GPU nodes dynamically** with Karpenter based on pending workload requirements.
-*   **Deploy NVIDIA GPU Operator** using Helm to manage driver compile and loading lifecycles.
-*   **Configure GPU Time Slicing** to share VRAM resources across multiple concurrent containers.
-*   **Run CUDA workloads** on EKS using target taints to validate execution sandboxes.
-*   **Observe GPU metrics** with DCGM Exporter, extracting hardware metrics on port 9400.
-*   **Visualize GPU utilization** in Grafana using Prometheus metrics scrape channels.
-*   **Investigate Kubernetes Device Plugin failures** and runtime recovery procedures under load.
-*   **Troubleshoot GPU scheduling** bottlenecks and node lifecycle consolidation disruptions.
-
----
-
-## Core Features
-
-*   **Dynamic Autoscaling:** I configured Karpenter NodePools to match GPU-specific resource demands (`nvidia.com/gpu`), scaling out spot compute instances (`g4dn`, `g6` families) to minimize execution costs.
-*   **Automated GPU Lifecycle:** Instantiated the GPU Operator to load kernel modules, configure the container runtime hook, and execute CUDA validators.
-*   **Virtual GPU Partitioning:** Implemented GPU Time Slicing to divide physical GPUs into multiple virtual slices, enabling smaller workloads to share resources.
-*   **Observability Pipeline:** Integrated DCGM Exporter with Prometheus and Grafana, capturing real-time SM execution and core temperatures.
+| Capability | Implementation |
+|---|---|
+| On-demand GPU provisioning | Karpenter NodePool constrained to `g4dn`/`g6` Spot, tainted `nvidia.com/gpu` so only GPU pods land there |
+| GPU driver + runtime | EKS NVIDIA-optimized AL2023 AMI supplies the driver and toolkit; GPU Operator manages the device plugin, NFD, and DCGM on top |
+| GPU sharing | 4-way time slicing via the device plugin `ClusterPolicy`, configured declaratively in Terraform |
+| Cost control | Spot everywhere, NodePool CPU/GPU limits, 1-minute consolidation on empty nodes, 100Gi gp3 root volumes only on GPU nodes |
+| Least-privilege IAM | Karpenter controller policy scoped by `aws:RequestTag`/`aws:ResourceTag` on the cluster ownership tag; `iam:PassRole` restricted to the node role |
+| Credentials | EKS Pod Identity throughout; no IRSA OIDC provider, no static keys, no `aws-auth` ConfigMap |
+| GPU telemetry | DCGM exporter scraped per-pod at 5s (a Service VIP would round-robin across GPU nodes and silently sample one at random) |
 
 ---
 
-## Repository Structure
+## Repository layout
 
 ```text
 ai-infrastructure-on-eks/
-├── 01-infrastructure/      # Terraform modules: VPC, subnets, EKS, and IAM OIDC roles
-├── 02-platform/            # Platform bootstraps: Argo CD, Karpenter pools, monitoring
-├── 03-workloads/           # CUDA execution validation deployments & GitOps manifests
-├── docs/                   # Guides, runbooks, and deep-dive conceptual notes
-│   ├── labs/               # 6 logical platform engineering hands-on labs
-│   ├── interview-notes/    # Conceptual systems design interview guides
-│   ├── architecture.md     # Sequence interactions & dependency flows
-│   ├── troubleshooting.md  # Production troubleshooting runbook
-│   ├── lessons-learned.md  # Engineering debugging journal & post-mortems
-│   ├── performance.md      # GPU performance, metrics, and latency observations
-│   └── roadmap.md          # Future enhancements (MIG, vLLM, Ray, Distributed Training)
-└── Makefile                # Operations entrypoint for TF and Kubernetes automation
+├── 01-infrastructure/       # Terraform root module
+│   ├── 01-network/          # VPC, subnets, NAT, EKS/Karpenter discovery tags
+│   └── 02-eks/              # Control plane, node group, addons, scoped IAM, access entries
+├── 02-platform/             # Helm releases: Argo CD, Karpenter, GPU Operator
+│   ├── karpenter/           # NodePool + EC2NodeClass manifests (CPU and GPU pools)
+│   └── monitoring/          # Prometheus + Grafana
+├── 03-workloads/            # CUDA load generator, time-slicing verification, Argo CD Application
+├── docs/                    # Architecture, labs, runbooks, interview notes
+└── Makefile                 # make apply / status / gpu-test / destroy
 ```
 
 ---
 
-## Deployment & Demo Workflow
+## Prerequisites
 
-I verified the entire bootstrap and execution workflow using the following progressive stages:
+- Terraform >= 1.5, AWS CLI v2, `kubectl`, `helm`
+- An AWS account with permission to create VPC, EKS, EC2, and IAM resources
+- **A GPU Spot quota above zero.** A fresh account often has an "All G and VT Spot
+  Instance Requests" quota of 0 vCPU, and Karpenter will report insufficient
+  capacity forever. Request an increase before you start:
+  ```bash
+  aws service-quotas get-service-quota --service-code ec2 --quota-code L-3819A6DF --region us-east-1
+  ```
 
-1.  **Infrastructure Initialization:**
-    ```bash
-    make init && make validate
-    ```
-2.  **Cluster Provisioning:**
-    ```bash
-    make apply
-    ```
-3.  **Dynamic Scale-up Verification:**
-    I scheduled a pending GPU job to trigger Karpenter node provisioning:
-    ```bash
-    kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
-    ```
-4.  **Operator Lifecycle Check:**
-    I verified the GPU Operator successfully loads driver layers:
-    ```bash
-    kubectl get pods -n gpu-operator -w
-    ```
-5.  **CUDA Computation Validation:**
-    I verified core hardware execution:
-    ```bash
-    kubectl apply -f 03-workloads/gpu-test-deployment.yaml
-    ```
-6.  **Scrape Verification:**
-    I queried metrics from the scrape engine:
-    ```bash
-    kubectl exec -n gpu-operator ds/nvidia-dcgm-exporter -- curl -s localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL
-    ```
+---
+
+## Deploy
+
+```bash
+make init
+make plan
+make apply          # ~15 min: VPC -> EKS -> addons -> platform Helm releases
+```
+
+`make apply` updates your kubeconfig at the end. Then:
+
+```bash
+make status         # nodes, advertised GPU capacity, Karpenter NodeClaims, operator pods
+```
+
+To debug a failure one layer at a time, `make apply-all` applies network, then
+EKS, then the platform separately.
+
+### Trigger GPU provisioning
+
+```bash
+make gpu-test       # deploys the CUDA load generator, then watches NodeClaims
+```
+
+The 4 replicas are unschedulable on the `t3.small` system node, so Karpenter
+launches a `g4dn.xlarge` Spot instance. Once the GPU Operator's device plugin
+registers, all 4 pods schedule onto that single card via time slicing.
+
+Verify the sharing actually happened — every pod should report the **same** node:
+
+```bash
+kubectl get pods -l app=gpu-test -o wide
+kubectl get nodes -l accelerator=nvidia-gpu \
+  -o custom-columns=NODE:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
+```
+
+`GPU` reads `4` with time slicing on, `1` with it off.
+
+### Observe
+
+```bash
+kubectl port-forward -n monitoring svc/grafana-service 3000:3000
+# http://localhost:3000 — credentials in 02-platform/monitoring/prometheus-grafana.yaml
+
+kubectl exec -n gpu-operator ds/nvidia-dcgm-exporter -- \
+  curl -s localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL
+```
+
+---
+
+## Cost and teardown
+
+A `g4dn.xlarge` Spot instance runs roughly **$0.15–0.25/hour**, and the NAT
+Gateway adds about **$0.045/hour** whether or not anything is running. The full
+stack idles at a few dollars a day and is easy to forget about.
+
+```bash
+make gpu-clean      # drop GPU workloads; Karpenter consolidates the node in ~1 min
+make destroy        # tear everything down
+```
+
+`make destroy` prints a verification command afterwards — run it. A destroy that
+fails partway can leave a NAT Gateway or a GPU node running, and that is the
+single most likely way this project costs you real money.
+
+---
+
+## Configuration
+
+Everything is a Terraform variable; see
+[`01-infrastructure/variables.tf`](01-infrastructure/variables.tf).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `region` | `us-east-1` | Also update the discovery tags in `02-platform/karpenter/*.yaml` |
+| `cluster_name` | `dev-eks-cluster` | Referenced literally by the Karpenter manifests |
+| `cluster_version` | `1.35` | Verify it is still in standard support before applying |
+| `gpu_time_slicing_replicas` | `4` | `1` disables time slicing |
+| `install_gpu_operator` | `true` | `false` exercises the CPU-only path with no GPU spend |
+| `enable_secrets_encryption` | `false` | KMS envelope encryption for etcd secrets; on for production |
+| `enabled_cluster_log_types` | `[]` | Control plane audit logs; on for production |
 
 ---
 
 ## Screenshots
 
-The following visual checkpoints demonstrate the verified state of the platform:
+### GPU telemetry in Grafana
+SM utilization, memory allocation, and temperature from the DCGM exporter.
 
-### 1. Observability Dashboard
-Displays high-resolution SM utility spikes, memory allocations, and thermal states:
-![Grafana Performance Dashboard](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/grafana_gpu_dashboard.png)
+![Grafana GPU dashboard](docs/images/grafana_gpu_dashboard.png)
 
-### 2. GPU Time Slicing Architecture
-Conceptual layout illustrating physical-to-virtual GPU resource partitioning:
-![GPU Time Slicing Architecture Diagram](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/gpu_time_slicing_diagram.png)
+### Karpenter provisioning a GPU node
+Controller logs from a pending GPU pod through to a registered node.
 
-### 3. Dynamic Provisioning
-Karpenter controller logs capturing EKS dynamic scale-up requests:
-![Karpenter GPU Node Provisioning Logs](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/karpenter_gpu_provisioning.png)
+![Karpenter GPU node provisioning logs](docs/images/karpenter_gpu_provisioning.png)
 
-### 4. GPU Hardware Status
-Device verification output inside container namespaces using `nvidia-smi`:
-![nvidia-smi command-line output](file:///Users/karthik.orugonda/github/ai-infrastructure-on-eks/docs/images/nvidia_smi_output.png)
+### `nvidia-smi` inside the container
+Device visibility from within the pod's namespace.
 
----
+![nvidia-smi output](docs/images/nvidia_smi_output.png)
 
-## Engineering Investigations & Outcomes
+### Time slicing
+How one physical GPU is presented as several schedulable units.
 
-*   **Validated** Kubelet-to-Device Plugin contracts, tracing `Register()`, `ListAndWatch()`, and `Allocate()` gRPC cycles.
-*   **Investigated** multi-tenant sharing methodologies, evaluating VRAM limits under GPU Time Slicing, MIG, and MPS.
-*   **Profiled** low-level metrics (`dcgm_sm_copy`, `dcgm_xid_errors`), implementing alert rules for hardware throttling and bus faults.
-*   **Troubleshot** real-world failure patterns including container runtime loops, invalid config mapping boundaries, and Karpenter multi-resource scheduling bottlenecks.
+![GPU time slicing diagram](docs/images/gpu_time_slicing_diagram.png)
 
 ---
 
-## Documentation Registry
+## Engineering notes
 
-To explore specific topics, refer to the following resources:
-*   **Hands-on Labs:** [01: Provisioning](docs/labs/01-gpu-node-provisioning.md) | [02: GPU Operator](docs/labs/02-gpu-operator.md) | [03: Device Plugin](docs/labs/03-device-plugin.md) | [04: Time-Slicing](docs/labs/04-time-slicing.md) | [05: Observability](docs/labs/05-dcgm-observability.md) | [06: Troubleshooting](docs/labs/06-production-troubleshooting.md)
-*   **Systems Architecture Guides:** [Architecture Deep-Dive](docs/architecture.md) | [Performance Profiling](docs/performance.md) | [Future Roadmap](docs/roadmap.md)
-*   **Interview Preparation Notes:** [Device Plugin Interface](docs/interview-notes/device-plugin.md) | [GPU Operator Internals](docs/interview-notes/gpu-operator.md) | [Virtualization Models](docs/interview-notes/time-slicing.md) | [Telemetry Metrics](docs/interview-notes/dcgm.md) | [Karpenter Scheduling](docs/interview-notes/karpenter.md)
-*   **Incident Journal:** [Lessons Learned & Post-Mortems](docs/lessons-learned.md)
+Decisions in here that took a while to get right, each documented at the point it
+applies:
+
+- **The GPU Operator must not install the driver on the EKS NVIDIA AMI.** The AMI
+  already ships the driver and toolkit. Enabling both gives two owners for one
+  kernel module: `nvidia-smi` works on the host while the driver DaemonSet sits in
+  `CrashLoopBackOff`. See `02-platform/main.tf`.
+- **Time slicing shares compute, not memory.** There is no VRAM isolation and no
+  per-pod memory limit, so one pod over-allocating causes CUDA OOM in its
+  neighbours. MIG is the answer when you need hard isolation.
+  See [docs/labs/04-time-slicing.md](docs/labs/04-time-slicing.md).
+- **Scrape DCGM per pod, not through the Service.** `dcgm-exporter` is a DaemonSet;
+  a `static_config` pointed at the Service VIP load balances to one arbitrary GPU
+  node per scrape. See `02-platform/monitoring/prometheus-grafana.yaml`.
+- **`create_before_destroy` on a node group needs a name prefix.** Node group names
+  must be unique per cluster, so a fixed name makes every replacing change fail
+  with a conflict. See `01-infrastructure/02-eks/main.tf`.
+- **Karpenter finalizers deadlock `terraform destroy`.** Destroying the controller
+  before its custom resources leaves nothing to remove the finalizers and the
+  destroy hangs. See the cleanup provisioner in `02-platform/main.tf`.
+
+---
+
+## Documentation
+
+**Hands-on labs**
+[01 Provisioning](docs/labs/01-gpu-node-provisioning.md) ·
+[02 GPU Operator](docs/labs/02-gpu-operator.md) ·
+[03 Device Plugin](docs/labs/03-device-plugin.md) ·
+[04 Time Slicing](docs/labs/04-time-slicing.md) ·
+[05 DCGM Observability](docs/labs/05-dcgm-observability.md) ·
+[06 Troubleshooting](docs/labs/06-production-troubleshooting.md)
+
+**Reference**
+[Architecture](docs/architecture.md) ·
+[Troubleshooting runbook](docs/troubleshooting.md) ·
+[Performance characteristics](docs/performance.md) ·
+[Roadmap](docs/roadmap.md) ·
+[Lessons learned](docs/lessons-learned.md)
+
+**Concept notes**
+[Device Plugin API](docs/interview-notes/device-plugin.md) ·
+[GPU Operator internals](docs/interview-notes/gpu-operator.md) ·
+[Time slicing vs MIG vs MPS](docs/interview-notes/time-slicing.md) ·
+[DCGM metrics](docs/interview-notes/dcgm.md) ·
+[Karpenter scheduling](docs/interview-notes/karpenter.md)
+
+---
+
+## License
+
+[MIT](LICENSE)

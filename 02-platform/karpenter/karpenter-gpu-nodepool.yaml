@@ -1,3 +1,8 @@
+# ==============================================================================
+# Karpenter GPU NodePool
+# ==============================================================================
+# Defines the shape of GPU capacity Karpenter is allowed to provision, and the
+# cost ceiling it may not exceed.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
@@ -6,35 +11,64 @@ spec:
   template:
     metadata:
       labels:
-        # Exposes the accelerator label to allow pod placement targeting GPUs
+        # Workloads target GPU capacity with nodeSelector: accelerator=nvidia-gpu.
         accelerator: nvidia-gpu
     spec:
+      # Recycle nodes after 30 days so they pick up new AMIs (kernel and driver
+      # patches) instead of drifting indefinitely.
       expireAfter: 720h
+
       requirements:
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
+
+        # Spot only. A GPU interruption here costs a restarted test workload,
+        # nothing more. Production inference should use on-demand or a mix.
         - key: karpenter.sh/capacity-type
           operator: In
-          values: ["spot"] # Provision cheap Spot instances to leverage credits
+          values: ["spot"]
+
+        # g4dn = NVIDIA Tesla T4 (16GB), the cheapest GPU instance family on EC2
+        # and the right choice for learning and light inference.
+        # g6   = NVIDIA L4 (24GB), newer and faster, meaningfully more expensive.
+        # Listing several types widens the Spot pool, which reduces the chance of
+        # a capacity-unavailable error and lowers interruption rates.
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: ["g4dn.xlarge", "g4dn.2xlarge", "g6.xlarge"] # Limit to NVIDIA T4 (g4dn) or NVIDIA ["g6.xlarge"] (more expensive)
+          values: ["g4dn.xlarge", "g4dn.2xlarge", "g6.xlarge"]
+
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: gpu-pool
-      # Taints are critical to prevent regular CPU pods from scheduling on expensive GPU instances
+
+      # Critical cost control: without this taint, any pod with no GPU request at
+      # all can land on a GPU node and block consolidation, so you pay GPU prices
+      # to run a sidecar. Only pods that explicitly tolerate it get scheduled here.
       taints:
         - key: nvidia.com/gpu
           value: "true"
           effect: NoSchedule
+
+  # Hard ceiling on this pool. Karpenter evaluates these against the PHYSICAL
+  # resources of the instance types above, not against the time-sliced
+  # nvidia.com/gpu count the device plugin advertises to the kubelet. So
+  # `nvidia.com/gpu: 2` means at most 2 real cards, which with the default
+  # 4-way time slicing is up to 8 schedulable GPU slices.
   limits:
-    # Restrict the maximum vCPUs and VRAM available to this pool to protect against runaway costs
     cpu: 8
     memory: 32Gi
     nvidia.com/gpu: 2
+
   disruption:
-    # Actively consolidate and terminate empty/underutilized GPU nodes to save costs
+    # Reclaim nodes that are empty or that could be replaced by something cheaper.
     consolidationPolicy: WhenEmptyOrUnderutilized
+    # Short window because idle GPU nodes are the most expensive thing here.
+    # Raise it if you see nodes churning during normal workload gaps.
     consolidateAfter: 1m
+
+    budgets:
+      # Never voluntarily disrupt more than one GPU node at a time, so a
+      # consolidation pass cannot take down all GPU capacity at once.
+      - nodes: "1"

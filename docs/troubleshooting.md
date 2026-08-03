@@ -77,8 +77,9 @@ This runbook catalogs operational issues, diagnostic workflows, and resolutions 
 *   **Purpose:** Verify if the host drivers are loaded and accessible.
     *   **Command:**
         ```bash
-        kubectl exec -n gpu-operator ds/nvidia-driver-daemonset -- nvidia-smi
+        kubectl exec -n gpu-operator ds/nvidia-device-plugin-daemonset -- nvidia-smi
         ```
+    *   **Note:** Many guides use `ds/nvidia-driver-daemonset` here. That DaemonSet does not exist in this cluster, because the driver ships in the EKS NVIDIA-optimized AMI and the operator runs with `driver.enabled=false`. See [Lab 02](labs/02-gpu-operator.md).
     *   **Expected Result:** Hardware status report from the driver module.
     *   **Validation:** Verify that `/dev/nvidiactl` and `/dev/nvidia0` are present on the host.
 
@@ -161,25 +162,35 @@ This runbook catalogs operational issues, diagnostic workflows, and resolutions 
     *   **Expected Result:** Detailed status block and event records.
     *   **Validation:** Check for compilation or container image pull failures.
 
-*   **Purpose:** Retrieve driver build container compiler logs.
+> [!NOTE]
+> **This failure mode does not occur in this cluster's default configuration.**
+> It applies when the GPU Operator manages the driver
+> (`gpu_driver_managed_by_operator = true`, or any plain AL2023/Ubuntu AMI).
+> Here the driver comes from the EKS NVIDIA-optimized AMI and there is no
+> compile step to fail. It is documented because it is the most common GPU
+> Operator failure in the wild, and because choosing the pre-installed path is
+> precisely how it was avoided.
+
+*   **Purpose:** Retrieve driver build container compiler logs (operator-managed driver only).
     *   **Command:**
         ```bash
         kubectl logs -n gpu-operator -l app=nvidia-driver-daemonset -c nvidia-driver --tail=100
         ```
-    *   **Expected Result:** GCC compiler compilation logs.
-    *   **Validation:** Check for compiler syntax errors or missing package files.
+    *   **Expected Result:** GCC compilation logs.
+    *   **Validation:** Check for compiler errors or missing kernel header packages.
 
 ### Root Cause
-*   **Kernel Version Drift:** The host operating system kernel was newer than the pre-compiled driver image version.
-*   **Internet Egress Blockage:** Compiler containers in private subnets failed to download external kernel headers.
+*   **Kernel Version Drift:** The host kernel is newer than any driver version the image can build against.
+*   **Missing Kernel Headers:** The compile container cannot fetch headers matching the running kernel.
+*   **Internet Egress Blockage:** Compile containers in private subnets could not reach upstream package repositories.
 
 ### Resolution
-*   Configure Karpenter to target specific AMIs matching the driver version support matrix.
-*   Use pre-baked GPU AMIs (such as the EKS-optimized AL2023 GPU AMI) to bypass compile-time actions.
-*   *For driver compiler settings, see the [GPU Operator Guide](interview-notes/gpu-operator.md).*
+*   Use a pre-baked GPU AMI (the EKS-optimized AL2023 NVIDIA AMI) and disable the operator's driver and toolkit operands. This is what this repository does — see `02-platform/main.tf`.
+*   If you must compile dynamically, pin the NodePool to AMIs whose kernel is covered by the driver support matrix.
+*   *For operand configuration, see the [GPU Operator Guide](interview-notes/gpu-operator.md) and [Lab 02](labs/02-gpu-operator.md).*
 
 ### Lessons Learned
-*   Dynamic driver compilation slows down cluster scaling. Pre-bake kernel drivers into node images for production networks.
+*   Dynamic driver compilation puts kernel-header availability and internet egress on the node bootstrap path. Pre-baked driver AMIs remove both dependencies and shorten scale-up.
 
 ---
 
@@ -207,30 +218,51 @@ This runbook catalogs operational issues, diagnostic workflows, and resolutions 
     *   **Validation:** Ensure the default selector matches the ConfigMap key.
 
 ### Root Cause
-*   **Malformed Configuration:** The ConfigMap data block lacked the `resources` map array list or used incorrect keys.
-*   **Namespace Mismatch:** The ConfigMap was created in a separate namespace (`default`) rather than the `gpu-operator` namespace.
+*   **Malformed Configuration:** The ConfigMap data block lacked the `resources` array or used incorrect keys.
+*   **Namespace Mismatch:** The ConfigMap was created in `default` rather than the `gpu-operator` namespace.
+*   **Key Mismatch:** `spec.devicePlugin.config.default` names a key that does not exist in the ConfigMap. The plugin then fails to start and GPU capacity disappears from the node entirely.
+*   **Ordering Race:** The ConfigMap was applied *after* the device plugin DaemonSet rolled out. The plugin reads it at startup, so it came up with no sharing config and advertised `1`.
 
 ### Resolution
-*   Re-deploy the ConfigMap to the correct namespace and patch the policy:
-    ```yaml
-    apiVersion: v1
-    kind: ConfigMap
-    metadata:
-      name: device-plugin-config
-      namespace: gpu-operator
-    data:
-      time-slicing-config: |-
-        version: v1
-        sharing:
-          timeSlicing:
-            resources:
-              - name: nvidia.com/gpu
-                replicas: 4
-    ```
-*   *For virtualization limitations, see the [Virtualization Models Guide](interview-notes/time-slicing.md).*
+
+In this repository time slicing is **owned by Terraform**, not by a hand-applied
+ConfigMap. The GPU Operator Helm release creates the ConfigMap and points the
+`ClusterPolicy` at it in one step, which is what removes the ordering race above.
+
+Change the slice count with a variable and re-apply:
+
+```bash
+terraform -chdir=01-infrastructure apply -var 'gpu_time_slicing_replicas=8'
+```
+
+To repair drift after someone patched the `ClusterPolicy` by hand:
+
+```bash
+terraform -chdir=01-infrastructure apply -target=module.bootstrap
+```
+
+The generated ConfigMap, for reference:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: device-plugin-config
+  namespace: gpu-operator
+data:
+  time-sliced: |-
+    version: v1
+    sharing:
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4
+```
+
+*   *See [Lab 04](labs/04-time-slicing.md) and the [Virtualization Models Guide](interview-notes/time-slicing.md).*
 
 ### Lessons Learned
-*   Validate configurations against the official schemas. Keep configuration resources co-located inside the Operator namespace.
+*   Configuration that a controller reads **at startup** must be created by the same unit of deployment as the controller. Splitting them across `kubectl apply` and Helm introduces an ordering dependency that works on a slow cluster and fails on a fast one.
 
 ---
 

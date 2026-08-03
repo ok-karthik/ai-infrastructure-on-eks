@@ -1,7 +1,63 @@
-.terraform
-**/.terraform
+# ==============================================================================
+# Terraform
+# ==============================================================================
+# Provider plugins and module caches. Large and machine-specific.
+.terraform/
+**/.terraform/
+
+# State contains resource IDs, and frequently secrets in plaintext (generated
+# passwords, private keys, certificate data). Never commit it. Use a remote
+# backend with encryption for anything shared - see 01-infrastructure/providers.tf.
 *.tfstate
 *.tfstate.*
-terraform.tfvars
+.terraform.tfstate.lock.info
 
-archive
+# Variable files routinely hold account IDs, ARNs, and credentials.
+# .tfvars.example files are safe to commit and are excluded from this rule.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Saved plan files embed the full state, including any secrets in it.
+*.tfplan
+crash.log
+crash.*.log
+
+# The lock file IS committed on purpose: it pins provider versions and checksums
+# so every apply and every CI run uses identical providers.
+!.terraform.lock.hcl
+
+# ==============================================================================
+# Kubernetes / Helm
+# ==============================================================================
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+charts/*.tgz
+
+# ==============================================================================
+# Credentials
+# ==============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+
+# ==============================================================================
+# Scratch
+# ==============================================================================
+archive/
+*.log
+tmp/
+scratch/
+
+# ==============================================================================
+# Editors & OS
+# ==============================================================================
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

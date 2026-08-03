@@ -28,16 +28,24 @@ graph LR
 
 ## Important Production Metrics
 
+DCGM exporter publishes metrics with the `DCGM_FI_` prefix. `DEV` fields come from
+the driver directly; `PROF` fields come from the profiling subsystem and carry
+more overhead but far more insight.
+
 | Metric Name | Description | Diagnostic Value |
 |---|---|---|
-| `dcgm_sm_copy` | Streaming Multiprocessor (SM) utility percentage. | Measures execution load and code parallelism. |
-| `dcgm_fb_used` | Frame Buffer (VRAM) allocated memory in MB. | Identifies memory leaks and VRAM fragmentation. |
-| `dcgm_fb_free` | Frame Buffer (VRAM) unallocated memory in MB. | Evaluates if a node has space to launch new models. |
-| `dcgm_gpu_temp` | Physical GPU core temperature. | Correlates performance drops to thermal limits. |
-| `dcgm_power_usage` | Real-time electrical draw in Watts. | Crucial for tracking carbon footprint and power caps. |
-| `dcgm_clock_throttle_reasons` | Bitmask representing current throttle triggers. | Debugs unexpected application slowness (e.g. thermal or power throttles). |
-| `dcgm_pcie_tx_throughput` | Host-to-device PCIe write rate (MB/s). | Measures data ingestion bottlenecking during batch transfers. |
-| `dcgm_xid_errors` | Raw hardware driver error code flags. | Primary indicator of physical GPU crashes or driver panics. |
+| `DCGM_FI_DEV_GPU_UTIL` | Percentage of time at least one kernel was resident on the GPU. | Cheapest utilization signal. Beware: measures occupancy over time, not throughput — one tiny kernel looping forever reads 100%. |
+| `DCGM_FI_PROF_SM_ACTIVE` | Fraction of SMs with at least one active warp. | The honest utilization metric. Reveals a "100% utilized" GPU that is actually using a fraction of its SMs. |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | Fraction of cycles the tensor pipes are active. | Whether a training/inference job is actually hitting tensor cores or falling back to FP32. |
+| `DCGM_FI_DEV_FB_USED` | Frame buffer (VRAM) in use, MiB. | Identifies leaks and headroom. Under time slicing this is the shared budget with no per-pod enforcement. |
+| `DCGM_FI_DEV_FB_FREE` | Frame buffer free, MiB. | Whether another model will fit on this node. |
+| `DCGM_FI_DEV_GPU_TEMP` | Core temperature, °C. | Correlates throughput drops with thermal limits. |
+| `DCGM_FI_DEV_POWER_USAGE` | Board power draw, Watts. | Sustained draw at TDP is the leading indicator of an imminent clock throttle. |
+| `DCGM_FI_DEV_SM_CLOCK` | Current SM clock, MHz. | A low clock alongside high utilization means throttling, not compute saturation. |
+| `DCGM_FI_DEV_CLOCK_THROTTLE_REASONS` | Bitmask of active throttle causes. | Distinguishes thermal from power from reliability throttling. |
+| `DCGM_FI_PROF_PCIE_TX_BYTES` / `_RX_BYTES` | PCIe bytes transferred. | Identifies host-to-device transfer as the bottleneck rather than compute. |
+| `DCGM_FI_DEV_XID_ERRORS` | NVIDIA XID fault code. | The primary hardware-health alert. Non-zero means a real driver or hardware fault. |
+| `DCGM_FI_DEV_ECC_DBE_VOL_TOTAL` | Uncorrectable ECC errors. | Failing memory. On Spot, replace the node rather than debugging it. |
 
 ---
 
@@ -59,9 +67,10 @@ An XID error is a critical system event logged by the NVIDIA driver. A non-zero 
 ---
 
 ## Operational Notes
-*   **SM Occupancy Metric Priority:** Standard CPU metrics are insufficient for GPU scaling. Decide scaling rules based on `dcgm_sm_copy` or `dcgm_fb_used`.
-*   **High-Resolution Scrapes:** Because GPU executions run in transient bursts, scrape intervals must be reduced to 5s to avoid metric smoothing.
-*   **Alerting Triggers:** Configure Prometheus Alertmanager rules to alert on `dcgm_xid_errors > 0` to identify crashing node hardware.
+*   **Scale on the right signal.** CPU metrics say nothing about GPU saturation. Drive autoscaling from `DCGM_FI_PROF_SM_ACTIVE` (real compute occupancy) or `DCGM_FI_DEV_FB_USED` (memory pressure), not from `DCGM_FI_DEV_GPU_UTIL` alone.
+*   **High-resolution scrapes.** GPU work arrives in bursts; a 30s interval samples the gaps and reports an idle GPU. This platform scrapes at 5s.
+*   **Scrape per pod, not through the Service.** `dcgm-exporter` is a DaemonSet. A `static_config` aimed at the Service VIP load balances to one arbitrary GPU node per scrape, silently producing meaningless graphs across a multi-node fleet. Use `kubernetes_sd_configs` with `role: pod` — see `02-platform/monitoring/prometheus-grafana.yaml`.
+*   **Alerting triggers.** Alert on `DCGM_FI_DEV_XID_ERRORS > 0` and on any non-zero `DCGM_FI_DEV_ECC_DBE_VOL_TOTAL` to catch failing hardware before workloads do.
 *   **Socket Path Access:** The DCGM Exporter requires host path mounts to read Kubelet socket endpoints for metadata injection.
 
 ---

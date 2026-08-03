@@ -1,189 +1,191 @@
-# Hands-On Infrastructure & Operations Labs
+# Hands-On Labs
 
-This index lists the 15 sequential labs implemented to validate capacity scaling, model virtualization, hardware observability, and chaos recovery configurations.
+A guided path through the platform, from an empty AWS account to a shared GPU
+with telemetry flowing.
 
----
-
-## Lab 1: Dynamic GPU Node Provisioning (Karpenter)
-*   **Target Guide:** For full systems details, see [Lab 1: GPU Node Provisioning](labs/01-gpu-node-provisioning.md).
-*   **Purpose:** Deploy the Karpenter autoscaling manifests.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 02-platform/karpenter/
-        ```
-    *   **Expected Result:** NodePool and EC2NodeClass configuration models registered.
-    *   **Validation:** Verify resources: `kubectl get nodepools,ec2nodeclasses`
-*   **Purpose:** Trigger dynamic scale-up by requesting GPU resources.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
-        ```
-    *   **Expected Result:** Karpenter provisions a `g4dn.xlarge` instance.
-    *   **Validation:** Monitor joining node status: `kubectl get nodes -l accelerator=nvidia-gpu -w`
+Each lab below has a full write-up under [`labs/`](labs/). This page is the index
+and the quick command reference; the linked guides carry the explanation, the
+failure modes, and the trade-offs.
 
 ---
 
-## Lab 2: Deploy the GPU Operator
-*   **Target Guide:** See [Lab 2: GPU Operator](labs/02-gpu-operator.md).
-*   **Purpose:** Install the GPU Operator via Helm.
-    *   **Command:**
-        ```bash
-        helm install gpu-operator nvidia/gpu-operator -n gpu-operator --create-namespace --version v24.3.0
-        ```
-    *   **Expected Result:** Operator components deploy to EKS.
-    *   **Validation:** Check reconciliation status: `kubectl get clusterpolicy default`
+## Prerequisites
+
+The cluster must be up (`make apply`) and your kubeconfig pointed at it
+(`make kubeconfig`). Confirm with:
+
+```bash
+make status
+```
 
 ---
 
-## Lab 3: Validate the Kubernetes Device Plugin
-*   **Target Guide:** See [Lab 3: Device Plugin](labs/03-device-plugin.md).
-*   **Purpose:** Verify Device Plugin gRPC registration with Kubelet.
-    *   **Command:**
-        ```bash
-        kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset --tail=50
-        ```
-    *   **Expected Result:** Logs indicating registration connection success.
-    *   **Validation:** Verify allocatable capacity: `kubectl describe node -l accelerator=nvidia-gpu | grep nvidia.com/gpu`
+## The path
+
+| # | Lab | What you learn | Guide |
+|---|---|---|---|
+| 1 | GPU node provisioning | How Karpenter turns a Pending pod into a Spot GPU instance | [01](labs/01-gpu-node-provisioning.md) |
+| 2 | GPU Operator | What makes a GPU schedulable, and why the driver is disabled here | [02](labs/02-gpu-operator.md) |
+| 3 | Device plugin | The kubelet gRPC contract: `Register`, `ListAndWatch`, `Allocate` | [03](labs/03-device-plugin.md) |
+| 4 | Time slicing | Sharing one card across pods, and what that does *not* isolate | [04](labs/04-time-slicing.md) |
+| 5 | DCGM observability | Exporting GPU telemetry and scraping it correctly | [05](labs/05-dcgm-observability.md) |
+| 6 | Production troubleshooting | Breaking it deliberately and diagnosing from symptoms | [06](labs/06-production-troubleshooting.md) |
 
 ---
 
-## Lab 4: Run CUDA Validation Workload
-*   **Purpose:** Run a validation workload container executing matrix multiplications.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 03-workloads/gpu-test-deployment.yaml
-        ```
-    *   **Expected Result:** The job schedules on the GPU node and prints computation logs.
-    *   **Validation:** Read execution log stdout: `kubectl logs -l app=gpu-test --tail=20`
+## Quick command reference
+
+### Provisioning
+
+```bash
+# CPU-only scale-out — validates the Karpenter path without GPU spend
+kubectl apply -f 03-workloads/cpu-test-deployment.yaml
+kubectl get nodeclaims -w
+
+# GPU scale-out
+make gpu-test
+```
+
+Watch the sequence: pods go `Pending`, a NodeClaim appears, a node registers,
+NFD labels it, the device plugin registers, pods bind.
+
+### GPU capacity
+
+```bash
+# What the scheduler believes is available
+kubectl get nodes -l accelerator=nvidia-gpu \
+  -o custom-columns=NODE:.metadata.name,CAPACITY:.status.capacity.'nvidia\.com/gpu',ALLOCATABLE:.status.allocatable.'nvidia\.com/gpu'
+
+# Operand health
+kubectl get pods -n gpu-operator
+kubectl get clusterpolicy default -o jsonpath='{.status.state}'
+```
+
+### Time slicing
+
+```bash
+kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
+kubectl wait --for=condition=Ready pod -l app=gpu-load-test --timeout=10m
+
+# The assertion: all 4 pods, one node
+kubectl get pods -l app=gpu-load-test -o wide
+```
+
+### Scheduling isolation
+
+The GPU NodePool is tainted `nvidia.com/gpu=true:NoSchedule`, so CPU workloads
+must never land on a GPU node:
+
+```bash
+kubectl apply -f 03-workloads/cpu-test-deployment.yaml
+kubectl get pods -l app=cpu-test -o wide
+```
+
+Cross-check the `NODE` column against
+`kubectl get nodes -l accelerator=nvidia-gpu` — there should be no overlap. If a
+CPU pod does land on a GPU node, the taint or the toleration is wrong, and you
+are paying GPU prices to run a pause container.
+
+### Telemetry
+
+```bash
+kubectl get pods -n gpu-operator -l app=nvidia-dcgm-exporter
+
+# Scrape the exporter directly
+kubectl exec -n gpu-operator ds/nvidia-dcgm-exporter -- \
+  curl -s localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL
+
+# Prometheus — check the dcgm-exporter job under Status > Targets
+kubectl port-forward -n monitoring svc/prometheus-service 9090:9090
+
+# Grafana — credentials are in 02-platform/monitoring/prometheus-grafana.yaml
+kubectl port-forward -n monitoring svc/grafana-service 3000:3000
+```
 
 ---
 
-## Lab 5: Configure GPU Time Slicing
-*   **Target Guide:** See [Lab 4: GPU Time Slicing](labs/04-time-slicing.md).
-*   **Purpose:** Apply Time Slicing configuration templates.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 02-platform/karpenter/karpenter-gpu-nodeclass.yaml
-        kubectl patch clusterpolicy default --type=merge -p '{"spec":{"devicePlugin":{"config":{"name":"device-plugin-config","default":"time-slicing-config"}}}}'
-        ```
-    *   **Expected Result:** GPU Operator updates node capacities.
-    *   **Validation:** Verify replicated node capacity (e.g. 4 virtual devices): `kubectl describe node | grep nvidia.com/gpu`
+## Failure-injection exercises
+
+Diagnosing from symptoms is the skill worth practising. Each of these has a
+recovery step; run them on a cluster you are willing to break.
+
+### 1. Request more GPUs than exist
+
+```bash
+kubectl run large-job --image=nvidia/cuda:12.2.0-base-ubuntu22.04 \
+  --overrides='{"spec":{"tolerations":[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}],"containers":[{"name":"large-job","image":"nvidia/cuda:12.2.0-base-ubuntu22.04","resources":{"limits":{"nvidia.com/gpu":8}}}]}}' \
+  --restart=Never
+
+kubectl describe pod large-job | tail -20
+```
+
+The pod stays `Pending`. The instructive part is the event text: Karpenter
+reports it cannot find an instance type satisfying the request, which is a
+different failure from "no capacity right now".
+
+```bash
+kubectl delete pod large-job
+```
+
+### 2. Break Karpenter's instance-type requirement
+
+```bash
+kubectl patch nodepool gpu-pool --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/requirements/2/values","value":["invalid-family"]}]'
+
+kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=50
+```
+
+Recover:
+
+```bash
+kubectl apply -f 02-platform/karpenter/karpenter-gpu-nodepool.yaml
+```
+
+### 3. Break the time-slicing config
+
+```bash
+kubectl patch clusterpolicy default --type=merge \
+  -p '{"spec":{"devicePlugin":{"config":{"default":"does-not-exist"}}}}'
+
+kubectl rollout status ds/nvidia-device-plugin-daemonset -n gpu-operator --timeout=60s
+kubectl logs -n gpu-operator ds/nvidia-device-plugin-daemonset --tail=30
+```
+
+The plugin fails to start on a config key that is not in the ConfigMap, GPU
+capacity disappears from the node, and running GPU pods are evicted. Recover by
+letting Terraform reassert the correct value:
+
+```bash
+terraform -chdir=01-infrastructure apply -target=module.bootstrap
+```
+
+> [!NOTE]
+> Guides for this stack often suggest injecting a bad `RUNTIME_ARGS` into
+> `spec.toolkit` to simulate a container-runtime outage. That does nothing here:
+> the toolkit is supplied by the EKS NVIDIA-optimized AMI and the operator's
+> toolkit operand is disabled, so there is no DaemonSet to break. See
+> [Lab 02](labs/02-gpu-operator.md) for why.
 
 ---
 
-## Lab 6: Deploy 4 Replicated GPU Pods
-*   **Purpose:** Schedule 4 pods requesting 1 GPU unit each.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 03-workloads/gpu-test-pod-workloads.yaml
-        ```
-    *   **Expected Result:** All 4 pods schedule concurrently on a single physical node.
-    *   **Validation:** Check node assignments: `kubectl get pods -o wide -l app=gpu-load-test`
+## Cleanup
+
+```bash
+kubectl delete -f 03-workloads/cpu-test-deployment.yaml --ignore-not-found
+make gpu-clean
+```
+
+Karpenter consolidates the empty GPU node about a minute later. Confirm it is
+gone before walking away:
+
+```bash
+kubectl get nodes -l accelerator=nvidia-gpu
+```
 
 ---
 
-## Lab 7: Verify Workload Scheduling Isolation
-*   **Purpose:** Deploy a standard CPU pod without GPU tolerations.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 03-workloads/cpu-test-deployment.yaml
-        ```
-    *   **Expected Result:** The CPU pod is scheduled on standard system node instances, bypassing the GPU node.
-    *   **Validation:** Check node labels on the selected host: `kubectl get pods -o wide | grep cpu-pod`
+## Related documentation
 
----
-
-## Lab 8: Deploy DCGM Exporter
-*   **Target Guide:** See [Lab 5: GPU Observability](labs/05-dcgm-observability.md).
-*   **Purpose:** Verify that the DCGM Exporter daemonset is executing.
-    *   **Command:**
-        ```bash
-        kubectl get pods -n gpu-operator -l app.kubernetes.io/name=nvidia-dcgm-exporter
-        ```
-    *   **Expected Result:** DCGM Exporter pods listed as `Running`.
-    *   **Validation:** Query metrics locally: `kubectl exec -n gpu-operator daemonset/nvidia-dcgm-exporter -- curl -s localhost:9400/metrics | head -n 10`
-
----
-
-## Lab 9: Deploy Prometheus Scraper Channels
-*   **Purpose:** Install Prometheus configurations to scrape exporter targets.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 02-platform/monitoring/prometheus-grafana.yaml
-        ```
-    *   **Expected Result:** Scraper deployments initialized.
-    *   **Validation:** Port-forward and check active targets: `kubectl port-forward svc/prometheus-service 9090:9090` (Verify target: `dcgm-exporter`)
-
----
-
-## Lab 10: Deploy Grafana Dashboards
-*   **Purpose:** Access the Grafana UI.
-    *   **Command:**
-        ```bash
-        kubectl port-forward svc/grafana-service 3000:3000
-        ```
-    *   **Expected Result:** Grafana port exposed locally on port `3000` (Access: `admin / admin`).
-    *   **Validation:** Confirm the GPU performance dashboard displays metric streams.
-
----
-
-## Lab 11: Inject Container Runtime Outages (Chaos Testing)
-*   **Target Guide:** See [Lab 6: Production Troubleshooting](labs/06-production-troubleshooting.md).
-*   **Purpose:** Inject a broken argument into the container toolkit configuration.
-    *   **Command:**
-        ```bash
-        kubectl patch clusterpolicy default --type=merge -p '{"spec":{"toolkit":{"env":[{"name":"RUNTIME_ARGS","value":"--invalid-arg"}]}}}'
-        ```
-    *   **Expected Result:** Nodes stop running new containers, throwing runtime errors.
-    *   **Validation:** Check toolkit events: `kubectl describe pod -n gpu-operator -l app=nvidia-toolkit-daemonset`
-
----
-
-## Lab 12: Recover Container Runtime Configuration
-*   **Purpose:** Revert the container runtime patch.
-    *   **Command:**
-        ```bash
-        kubectl patch clusterpolicy default --type=merge -p '{"spec":{"toolkit":{"env":[]}}}'
-        ```
-    *   **Expected Result:** ClusterPolicy reconciles successfully.
-    *   **Validation:** Check that pods transition back to a `Running` status.
-
----
-
-## Lab 13: Troubleshoot Mismatched Resource Requests
-*   **Purpose:** Deploy a pod requesting more GPU resources than are physically available (e.g. requesting 8 GPUs on a 1-GPU host).
-    *   **Command:**
-        ```bash
-        kubectl run large-job --image=nvidia/cuda:12.0.0-base-ubuntu20.04 --requests="nvidia.com/gpu=8" --restart=Never
-        ```
-    *   **Expected Result:** Pod remains stuck in `Pending` state.
-    *   **Validation:** Check events for scheduling feedback: `kubectl describe pod large-job`
-
----
-
-## Lab 14: Troubleshoot Karpenter Node Selector Mismatches
-*   **Purpose:** Configure an invalid requirement on the Karpenter NodePool.
-    *   **Command:**
-        ```bash
-        kubectl patch nodepool gpu-pool --type=json -p='[{"op": "replace", "path": "/spec/template/spec/requirements/2/values", "value": ["invalid-family"]}]'
-        ```
-    *   **Expected Result:** Scaling requests fail.
-    *   **Validation:** Verify Karpenter errors: `kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter`
-
----
-
-## Lab 15: Perform Live GPU Telemetry Scrapes
-*   **Purpose:** Run a high-load simulation job and scrape GPU utilization.
-    *   **Command:**
-        ```bash
-        kubectl apply -f 03-workloads/gpu-test-deployment.yaml
-        ```
-    *   **Expected Result:** Metric values increase under computation.
-    *   **Validation:** Query the exporter endpoint directly: `kubectl exec -n gpu-operator daemonset/nvidia-dcgm-exporter -- curl -s localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL`
-
----
-
-## Related Documentation
-*   **Systems Guides:** [Architecture Deep-Dive](architecture.md) | [Performance Observations](performance.md) | [Roadmap Future Enhancements](roadmap.md)
-*   **Detailed Labs:** [01: Provisioning](labs/01-gpu-node-provisioning.md) | [02: GPU Operator](labs/02-gpu-operator.md) | [03: Device Plugin](labs/03-device-plugin.md) | [04: Time-Slicing](labs/04-time-slicing.md) | [05: Observability](labs/05-dcgm-observability.md) | [06: Troubleshooting](labs/06-production-troubleshooting.md)
-*   **Journal Logs:** [Post-Mortems & Lessons Learned](lessons-learned.md)
+- **Reference:** [Architecture](architecture.md) · [Troubleshooting runbook](troubleshooting.md) · [Performance](performance.md) · [Roadmap](roadmap.md)
+- **Journal:** [Lessons learned](lessons-learned.md)
