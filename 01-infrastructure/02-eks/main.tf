@@ -13,23 +13,31 @@
 # 2. It supports audit logging via AWS CloudTrail (showing exactly when EKS decrypted a secret).
 # 3. It allows manual key rotation and key revocation in case of an incident.
 # Without any encryption config, secrets in etcd would be stored in plaintext or basic base64.
-# resource "aws_kms_key" "eks" {
-#   description             = "KMS Customer Managed Key for EKS etcd secrets envelope encryption"
-#   deletion_window_in_days = 7    # If deleted, wait 7 days before permanent destruction (allows recovery if accidental)
-#   enable_key_rotation     = true # Automatically rotates the backing key material once a year (compliance requirement)
-# 
-#   tags = {
-#     Name = "${var.cluster_name}-eks-kms-key"
-#   }
-# }
-# 
-# # Why it's needed: Creates a human-readable name (alias) for the KMS key.
-# # What happens without it: You would have to reference the key by its long UUID or ARN,
-# # which is hard to read and manage in other configurations or CLI commands.
-# resource "aws_kms_alias" "eks" {
-#   name          = "alias/${var.cluster_name}-eks-key"
-#   target_key_id = aws_kms_key.eks.key_id
-# }
+#
+# Gated behind var.enable_secrets_encryption: a CMK carries a monthly cost and
+# slows cluster create/destroy, which is not worth it for a dev cluster that gets
+# torn down daily. Turn it on for anything production-like.
+resource "aws_kms_key" "eks" {
+  count = var.enable_secrets_encryption ? 1 : 0
+
+  description             = "KMS Customer Managed Key for EKS etcd secrets envelope encryption"
+  deletion_window_in_days = 7    # If deleted, wait 7 days before permanent destruction (allows recovery if accidental)
+  enable_key_rotation     = true # Automatically rotates the backing key material once a year (compliance requirement)
+
+  tags = {
+    Name = "${var.cluster_name}-eks-kms-key"
+  }
+}
+
+# Why it's needed: Creates a human-readable name (alias) for the KMS key.
+# What happens without it: You would have to reference the key by its long UUID or ARN,
+# which is hard to read and manage in other configurations or CLI commands.
+resource "aws_kms_alias" "eks" {
+  count = var.enable_secrets_encryption ? 1 : 0
+
+  name          = "alias/${var.cluster_name}-eks-key"
+  target_key_id = aws_kms_key.eks[0].key_id
+}
 
 # ==============================================================================
 # EKS Cluster Control Plane Configuration
@@ -55,7 +63,7 @@ resource "aws_eks_cluster" "this" {
   # Why it's needed: Specifies the EKS Service IAM Role that EKS uses to call other
   # AWS services (like EC2, VPC, ELB) on your behalf.
   role_arn = aws_iam_role.cluster.arn
-  version  = "1.35" # Specifies the Kubernetes version. 1.35 is a modern EKS release.
+  version  = var.cluster_version
 
   # Why it's needed: Configures network communication for the EKS API Server endpoint.
   # subnet_ids: EKS deploys control plane cross-account ENIs in these subnets to talk to nodes.
@@ -89,19 +97,24 @@ resource "aws_eks_cluster" "this" {
   # What happens without it: If the control plane malfunctions or someone performs
   # unauthorized actions inside the cluster, you will have zero log history or audit trail,
   # making debugging and security compliance impossible.
-  # Set to [] in development to speed up cluster creation and destruction.
-  enabled_cluster_log_types = []
+  # Defaults to [] in development to speed up cluster creation/destruction and avoid
+  # CloudWatch Logs ingestion charges. Set var.enabled_cluster_log_types for production.
+  enabled_cluster_log_types = var.enabled_cluster_log_types
 
   # Why it's needed: Connects the KMS key defined above to EKS for encrypting secrets.
-  # What happens without it: Secrets inside the Kubernetes etcd database will not be
-  # encrypted at rest using your Customer Managed Key.
-  # Commented out in development to speed up cluster creation and destruction.
-  # encryption_config {
-  #   provider {
-  #     key_arn = aws_kms_key.eks.arn
-  #   }
-  #   resources = ["secrets"]
-  # }
+  # What happens without it: Secrets inside the Kubernetes etcd database are protected
+  # only by the AWS-managed default key rather than a key whose policy and audit trail
+  # you control.
+  dynamic "encryption_config" {
+    for_each = var.enable_secrets_encryption ? [1] : []
+
+    content {
+      provider {
+        key_arn = aws_kms_key.eks[0].arn
+      }
+      resources = ["secrets"]
+    }
+  }
 
   # Why this depends_on is critical:
   # During creation: EKS needs the IAM role policy attachment to exist BEFORE it boots.
@@ -219,10 +232,17 @@ resource "aws_iam_role_policy_attachment" "node_group_AmazonEC2ContainerRegistry
 # What happens without it: You have a control plane but no compute nodes. You cannot
 # run any application workloads in the cluster.
 resource "aws_eks_node_group" "this" {
-  cluster_name    = aws_eks_cluster.this.name
-  node_group_name = var.node_group_name
-  node_role_arn   = aws_iam_role.node_group.arn
-  subnet_ids      = var.subnet_ids # Nodes are deployed in the private subnets for security
+  cluster_name = aws_eks_cluster.this.name
+
+  # node_group_name_prefix rather than node_group_name, because this resource uses
+  # create_before_destroy (see the lifecycle block below). Node group names must be
+  # unique within a cluster, so a fixed name makes the "create the replacement first"
+  # step fail with a name conflict on every replacing change. The prefix lets AWS
+  # generate a unique suffix per generation.
+  node_group_name_prefix = var.node_group_name
+
+  node_role_arn = aws_iam_role.node_group.arn
+  subnet_ids    = var.subnet_ids # Nodes are deployed in the private subnets for security
 
   # Why it's needed: Configures Auto Scaling limits for the node group.
   # - desired_size: The target number of nodes to maintain under normal conditions.
@@ -233,11 +253,11 @@ resource "aws_eks_node_group" "this" {
   # group won't grow, causing pods to fail to schedule due to CPU/Memory exhaustion.
   scaling_config {
     desired_size = var.node_group_desired_capacity
-    max_size     = var.node_group_desired_capacity + 2
-    min_size     = 1
+    max_size     = var.node_group_max_size
+    min_size     = var.node_group_min_size
   }
 
-  instance_types = var.node_group_instance_types                        # t3.micro/small for cost efficiency in dev
+  instance_types = var.node_group_instance_types                        # t3.small for cost efficiency in dev
   capacity_type  = var.node_group_type == "spot" ? "SPOT" : "ON_DEMAND" # SPOT saves ~70% cost
 
   # Explicit dependencies ensure IAM roles and policies are fully attached BEFORE EC2

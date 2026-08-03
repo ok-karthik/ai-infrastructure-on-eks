@@ -1,3 +1,20 @@
+# ==============================================================================
+# Argo CD Application: Platform Bootstrap
+# ==============================================================================
+# Hands ownership of the Karpenter NodePools and EC2NodeClasses to Argo CD.
+#
+# Until this is applied, those manifests are pushed by the local-exec provisioner
+# in 02-platform/main.tf, which is fine for a first bootstrap but has no drift
+# detection. Once Argo CD owns them, editing a NodePool in Git is the only way it
+# changes, and a manual `kubectl edit` is reverted within the sync interval.
+#
+# Prerequisite: the Argo CD application controller must be running. The default
+# install in this repo sets server.replicas = 0 to fit a t3.small; the controller
+# still reconciles, you just have no web UI. Set argocd_enable_server = true if
+# you want the dashboard.
+#
+#   kubectl apply -f 03-workloads/argocd-app.yaml
+#   kubectl get application -n argocd gpu-platform-bootstrap
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -5,15 +22,24 @@ metadata:
   namespace: argocd
 spec:
   project: default
+
   source:
-    # Point to the user's repository target URL when deployed in production
-    repoURL: 'https://github.com/YOUR_GITHUB_USERNAME/ai-infrastructure-on-eks.git'
+    # Update this if you fork the repository.
+    repoURL: "https://github.com/ok-karthik/ai-infrastructure-on-eks.git"
+    # Pin to a tag or commit SHA for production. HEAD means the cluster follows
+    # whatever lands on the default branch, so a bad merge deploys itself.
     targetRevision: HEAD
     path: 02-platform/karpenter
+
   destination:
-    server: 'https://kubernetes.default.svc'
+    server: "https://kubernetes.default.svc"
+    # Karpenter NodePools and EC2NodeClasses are cluster-scoped; this namespace
+    # only applies to any namespaced resources under the same path.
     namespace: default
+
   syncPolicy:
     automated:
-      prune: true     # Automatically deletes resources in EKS if deleted from Git
-      selfHeal: true  # Automatically overrides manual changes in EKS to match Git
+      prune: true    # Delete cluster resources when they are removed from Git
+      selfHeal: true # Revert manual changes made directly against the cluster
+    syncOptions:
+      - CreateNamespace=true

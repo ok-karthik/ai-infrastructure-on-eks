@@ -1,16 +1,51 @@
+# ==============================================================================
+# Karpenter GPU EC2NodeClass
+# ==============================================================================
+# The AWS-specific half of the GPU NodePool: which AMI, which IAM role, and which
+# subnets and security groups new GPU instances get.
+#
+# NOTE: `role` and the discovery tag values below embed the cluster name
+# literally. If you change var.cluster_name in 01-infrastructure, update this file
+# and karpenter-nodeclass.yaml to match, or Karpenter will fail to find a subnet.
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
   name: gpu-pool
 spec:
-  amiFamily: AL2023 # Use Amazon Linux 2023 for GPU instances
-  role: dev-eks-cluster-karpenter-node-role # The node IAM role Karpenter-launched instances will assume
+  amiFamily: AL2023
+
+  # The node IAM role created in 01-infrastructure/02-eks/karpenter.tf. Karpenter
+  # wraps this in an instance profile it manages itself.
+  role: dev-eks-cluster-karpenter-node-role
+
   amiSelectorTerms:
-    # Use name matching to discover the official GPU-optimized EKS AMIs
+    # The EKS NVIDIA-optimized AL2023 AMI. This already contains the NVIDIA kernel
+    # driver, the container toolkit, and a containerd configured with the nvidia
+    # runtime. That is why the GPU Operator is installed with driver.enabled=false
+    # and toolkit.enabled=false in 02-platform/main.tf: letting the operator also
+    # manage them gives two owners for one kernel module and the driver DaemonSet
+    # crash-loops.
+    #
+    # Wildcard on the version suffix so new AMI releases are picked up; combined
+    # with expireAfter: 720h on the NodePool, nodes roll onto patched AMIs
+    # automatically. Pin the full name if you need byte-identical nodes.
     - name: amazon-eks-node-al2023-x86_64-nvidia-*
+      owner: "amazon"
+
   subnetSelectorTerms:
     - tags:
         karpenter.sh/discovery: dev-eks-cluster
+
   securityGroupSelectorTerms:
     - tags:
         karpenter.sh/discovery: dev-eks-cluster
+
+  # GPU container images are large (the CUDA devel image alone is several GB) and
+  # the AL2023 default 20Gi root volume fills up, causing ImagePullBackOff with
+  # "no space left on device" after two or three pulls.
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        deleteOnTermination: true

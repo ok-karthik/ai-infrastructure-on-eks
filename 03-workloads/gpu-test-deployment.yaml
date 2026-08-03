@@ -1,7 +1,19 @@
+# ==============================================================================
+# GPU Load Generator
+# ==============================================================================
+# Purpose: saturate the GPU so DCGM reports non-zero utilization, and prove that
+# time slicing actually schedules more pods than there are physical GPUs.
+#
+# With gpu_time_slicing_replicas = 4 (the default), a single g4dn.xlarge advertises
+# nvidia.com/gpu: 4, so all 4 replicas land on ONE physical Tesla T4.
+# With time slicing disabled, only 1 replica runs and the other 3 stay Pending
+# while Karpenter provisions more GPU nodes up to the NodePool limit.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gpu-test-deployment
+  labels:
+    app: gpu-test
 spec:
   replicas: 4
 
@@ -15,62 +27,84 @@ spec:
         app: gpu-test
 
     spec:
+      # Matches the taint on the Karpenter GPU NodePool. Without this toleration
+      # the pod is unschedulable on GPU nodes and Karpenter never provisions one.
       tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      # Pins the workload to the GPU NodePool. Requesting nvidia.com/gpu alone is
+      # enough for Karpenter, but the explicit selector documents the intent and
+      # stops the pod landing on a general-purpose node if the resource is ever
+      # advertised elsewhere.
+      nodeSelector:
+        accelerator: nvidia-gpu
 
       containers:
-      - name: gpu-load-generator
+        - name: gpu-load-generator
+          # -devel rather than -base: the image needs nvcc to compile the kernel
+          # below. In production you would compile once and ship a runtime image;
+          # compiling at pod start keeps this manifest self-contained.
+          image: nvidia/cuda:12.2.0-devel-ubuntu22.04
 
-        image: nvidia/cuda:12.2.0-devel-ubuntu22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
 
-        command:
-        - /bin/bash
-        - -c
+              cat << 'EOF' > load.cu
+              #include <cuda_runtime.h>
+              #include <cstdio>
 
-        args:
-        - |
-          cat << 'EOF' > load.cu
-          #include <cuda_runtime.h>
-          #include <iostream>
+              #define N 1000000
 
-          __global__ void kernel(float *a) {
-            int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-            if (idx < 1000000) {
-              float x = idx;
-
-              for (int i = 0; i < 100000; i++) {
-                x = x * 1.00001f + 0.00001f;
+              __global__ void kernel(float *a) {
+                int idx = blockIdx.x * blockDim.x + threadIdx.x;
+                if (idx < N) {
+                  float x = idx;
+                  for (int i = 0; i < 100000; i++) {
+                    x = x * 1.00001f + 0.00001f;
+                  }
+                  a[idx] = x;
+                }
               }
 
-              a[idx] = x;
-            }
-          }
+              int main() {
+                float *d;
+                cudaError_t err = cudaMalloc(&d, N * sizeof(float));
+                if (err != cudaSuccess) {
+                  fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(err));
+                  return 1;
+                }
 
-          int main() {
-            float *d;
+                printf("Starting sustained GPU load...\n");
+                fflush(stdout);
 
-            cudaMalloc(&d, 1000000 * sizeof(float));
+                while (true) {
+                  kernel<<<4096, 256>>>(d);
+                  err = cudaDeviceSynchronize();
+                  if (err != cudaSuccess) {
+                    fprintf(stderr, "kernel failed: %s\n", cudaGetErrorString(err));
+                    return 1;
+                  }
+                }
+                return 0;
+              }
+              EOF
 
-            std::cout << "Starting infinite GPU load..." << std::endl;
+              echo "Compiling CUDA kernel..."
+              nvcc load.cu -o load
 
-            while (true) {
-              kernel<<<4096,256>>>(d);
-              cudaDeviceSynchronize();
-            }
+              echo "Running..."
+              exec ./load
 
-            return 0;
-          }
-          EOF
-
-          echo "Compiling..."
-          nvcc load.cu -o load
-
-          echo "Running..."
-          ./load
-
-        resources:
-          limits:
-            nvidia.com/gpu: 1
+          resources:
+            limits:
+              # nvidia.com/gpu is an extended resource: it may only appear as a
+              # limit, and Kubernetes copies it into requests automatically. Under
+              # time slicing this consumes one virtual slice, not a whole card.
+              nvidia.com/gpu: 1
+            requests:
+              cpu: 500m
+              memory: 1Gi

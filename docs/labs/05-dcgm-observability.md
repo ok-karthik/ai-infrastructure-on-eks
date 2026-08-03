@@ -49,7 +49,7 @@ spec:
 *   **Purpose:** Query the exporter endpoint directly from the node.
     *   **Command:**
         ```bash
-        kubectl exec -n gpu-operator ds/nvidia-dcgm-exporter -- curl -s localhost:9400/metrics | grep "dcgm_sm_copy"
+        kubectl exec -n gpu-operator ds/nvidia-dcgm-exporter -- curl -s localhost:9400/metrics | grep "DCGM_FI_DEV_GPU_UTIL"
         ```
     *   **Expected Result:** Active Prometheus-formatted metrics logs returned.
     *   **Validation:** Confirm lines containing active metric values are present.

@@ -1,6 +1,31 @@
-# 1. Fetch the official AWS Load Balancer Controller IAM Policy document
+# ==============================================================================
+# AWS Load Balancer Controller IAM
+# ==============================================================================
+# NOTE: this role is provisioned but the controller itself is not installed by
+# this repository. It is here so that adding the controller (via Helm, bound to
+# the aws-load-balancer-controller-sa ServiceAccount below) requires no IAM work.
+
+# 1. Fetch the official AWS Load Balancer Controller IAM Policy document.
+#
+# Pinned to a release tag, not `main`. Reading this from `main` means every
+# `terraform apply` silently adopts whatever permissions upstream merged that
+# day: the plan diff changes without any change in this repository, and an
+# upstream mistake becomes an IAM grant in your account. Bump the version
+# deliberately when you upgrade the controller.
 data "http" "lbc_iam_policy" {
-  url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json"
+  url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/${var.alb_controller_version}/docs/install/iam_policy.json"
+
+  # Fail loudly at plan time instead of writing an HTML error page into an IAM policy.
+  request_headers = {
+    Accept = "application/json"
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = self.status_code == 200
+      error_message = "Failed to fetch the AWS Load Balancer Controller IAM policy for version ${var.alb_controller_version} (HTTP ${self.status_code}). Check that the tag exists in kubernetes-sigs/aws-load-balancer-controller."
+    }
+  }
 }
 
 # 2. Create the IAM Policy in AWS

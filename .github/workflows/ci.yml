@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No AWS credentials are configured anywhere in this workflow. Every check below
+# is static: formatting, syntax, linting, and manifest parsing. Nothing here
+# contacts AWS or plans against real state.
+env:
+  TERRAFORM_VERSION: "1.15.1"
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Format check
+        run: |
+          terraform -chdir=01-infrastructure fmt -recursive -check -diff
+          terraform -chdir=02-platform fmt -recursive -check -diff
+
+      # -backend=false skips backend initialization, so this works with no
+      # credentials and no state bucket. Providers are still downloaded, which is
+      # what `validate` needs to check resource schemas.
+      - name: Init
+        run: terraform -chdir=01-infrastructure init -backend=false -input=false
+
+      - name: Validate
+        run: terraform -chdir=01-infrastructure validate
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: latest
+
+      - name: Init tflint
+        run: tflint --init
+        working-directory: 01-infrastructure
+
+      # --recursive covers the 01-network and 02-eks child modules.
+      # --minimum-failure-severity=warning so a new warning fails the build
+      # instead of accumulating unnoticed.
+      - name: Run tflint
+        run: tflint --recursive --minimum-failure-severity=warning
+        working-directory: 01-infrastructure
+
+  manifests:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate YAML parses
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+
+          roots = ["02-platform/karpenter", "02-platform/monitoring", "03-workloads"]
+          failed = False
+
+          for root in roots:
+              for path in sorted(pathlib.Path(root).rglob("*.yaml")):
+                  try:
+                      docs = [d for d in yaml.safe_load_all(path.read_text()) if d]
+                  except yaml.YAMLError as exc:
+                      print(f"FAIL  {path}: {exc}")
+                      failed = True
+                      continue
+
+                  if not docs:
+                      # Catches a manifest that is entirely commented out, which
+                      # applies cleanly and does nothing at all.
+                      print(f"FAIL  {path}: contains no YAML documents")
+                      failed = True
+                      continue
+
+                  for doc in docs:
+                      if "kind" not in doc or "apiVersion" not in doc:
+                          print(f"FAIL  {path}: document missing apiVersion/kind")
+                          failed = True
+
+                  print(f"OK    {path} ({len(docs)} document(s))")
+
+          sys.exit(1 if failed else 0)
+          PY
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check for absolute local paths and broken relative links
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          failed = False
+          link_re = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+
+          for md in sorted(pathlib.Path(".").rglob("*.md")):
+              if any(part in {".git", "archive"} for part in md.parts):
+                  continue
+              text = md.read_text()
+
+              # A file:// link leaks the author's local filesystem path and
+              # renders as a dead link (or a missing image) on GitHub.
+              if "file://" in text:
+                  print(f"FAIL  {md}: contains a file:// link")
+                  failed = True
+
+              for target in link_re.findall(text):
+                  if target.startswith(("http://", "https://", "#", "mailto:")):
+                      continue
+                  resolved = (md.parent / target.split("#")[0]).resolve()
+                  if not resolved.exists():
+                      print(f"FAIL  {md}: broken link -> {target}")
+                      failed = True
+
+          print("Docs link check complete.")
+          sys.exit(1 if failed else 0)
+          PY

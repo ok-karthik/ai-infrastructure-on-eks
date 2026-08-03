@@ -2,58 +2,78 @@
 # EKS Cluster Authorization & Access Entries
 # ==============================================================================
 # Note: EKS API authentication is decoupled from AWS IAM by default. Even if an IAM
-# principal has AdministratorAccess in AWS, they CANNOT access EKS/Kubectl unless
+# principal has AdministratorAccess in AWS, they CANNOT access EKS/kubectl unless
 # they are explicitly registered in EKS Access Entries and bound to an EKS Access Policy.
 
-# 1. Fetch your current AWS account ID dynamically to construct the Root ARN.
+# Resolve the identity Terraform is currently running as. This is what we grant
+# cluster-admin to, so the configuration works for any operator without editing
+# a hardcoded IAM user name into the repository.
 data "aws_caller_identity" "current" {}
 
-# 2. Create an Access Entry for your AWS Account Root user
-# Why it's needed: Registers the AWS account root principal (which console/admins assume)
-# in the EKS cluster mapping list.
-# What happens without it: Root account users cannot view or manage EKS resources via kubectl.
-resource "aws_eks_access_entry" "console_access" {
-  cluster_name  = aws_eks_cluster.this.name
-  principal_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-  # Let's dynamically inject the current account ID using string interpolation:
-  # principal_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-  # Wait, let's use string interpolation correctly in Terraform:
-  # principal_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-  type = "STANDARD"
+# Assumed-role sessions surface as
+# arn:aws:sts::<account>:assumed-role/<role-name>/<session-name>, but EKS Access
+# Entries require the underlying IAM role ARN
+# (arn:aws:iam::<account>:role/<role-name>). Normalize the two forms here so the
+# module works whether you authenticate as an IAM user or via an assumed role
+# (SSO, CI/CD, `aws sts assume-role`).
+locals {
+  caller_arn_parts = split("/", data.aws_caller_identity.current.arn)
+
+  is_assumed_role = startswith(data.aws_caller_identity.current.arn, "arn:aws:sts::") && strcontains(data.aws_caller_identity.current.arn, ":assumed-role/")
+
+  normalized_caller_arn = local.is_assumed_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.caller_arn_parts[1]}" : data.aws_caller_identity.current.arn
+
+  # var.cluster_admin_principal_arn wins when set, so CI or a shared team role can
+  # be granted admin independently of whoever ran the apply.
+  cluster_admin_arn = coalesce(var.cluster_admin_principal_arn, local.normalized_caller_arn)
 }
 
-# 3. Bind the Admin Policy to the Root user
-# Why it's needed: Associates cluster-wide Administrator privileges inside Kubernetes RBAC
-# to the Root access entry.
-# What happens without it: Root users can authenticate, but all commands will fail with 'Forbidden'.
-resource "aws_eks_access_policy_association" "console_admin" {
+# Register the administrating principal in the cluster's access entry list.
+# Why it's needed: without an access entry, kubectl and the Helm provider return
+# authentication errors even for an AWS account administrator.
+resource "aws_eks_access_entry" "cluster_admin" {
+  cluster_name  = aws_eks_cluster.this.name
+  principal_arn = local.cluster_admin_arn
+  type          = "STANDARD"
+}
+
+# Bind the AWS-managed cluster admin policy to that access entry.
+# Why it's needed: an access entry only establishes *identity*. Without a policy
+# association the principal authenticates successfully but every API call is
+# rejected with 'Forbidden' because it holds no Kubernetes RBAC permissions.
+resource "aws_eks_access_policy_association" "cluster_admin" {
   cluster_name  = aws_eks_cluster.this.name
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
-  principal_arn = aws_eks_access_entry.console_access.principal_arn
+  principal_arn = aws_eks_access_entry.cluster_admin.principal_arn
 
   access_scope {
     type = "cluster"
   }
 }
 
-# 4. Create an Access Entry for your Terraform admin user
-# Why it's needed: Registers the IAM user 'terraform-admin' (which you use locally to run
-# terraform and kubectl) in the EKS cluster mapping list.
-# What happens without it: Your local kubectl commands immediately return auth errors.
-resource "aws_eks_access_entry" "terraform_admin_access" {
+# ==============================================================================
+# Optional: Additional Admin Principals
+# ==============================================================================
+# Why it's needed: real teams need more than one break-glass admin. This lets you
+# add teammates or an automation role without editing the module.
+#
+# Deliberately NOT granting the account root principal cluster-admin: root should
+# never be used for day-to-day access, and an access entry for it widens the blast
+# radius of a root credential compromise for no operational benefit.
+resource "aws_eks_access_entry" "additional_admins" {
+  for_each = toset(var.additional_cluster_admin_arns)
+
   cluster_name  = aws_eks_cluster.this.name
-  principal_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:user/terraform-admin"
+  principal_arn = each.value
   type          = "STANDARD"
 }
 
-# 5. Bind the Admin Policy to the Terraform user
-# Why it's needed: Grants full administrator rights to the 'terraform-admin' user.
-# What happens without it: If set to ViewerPolicy, commands like 'kubectl get pods' or
-# 'helm install' return 'Forbidden' because the user lacks write/create permissions.
-resource "aws_eks_access_policy_association" "terraform_admin_policy" {
+resource "aws_eks_access_policy_association" "additional_admins" {
+  for_each = aws_eks_access_entry.additional_admins
+
   cluster_name  = aws_eks_cluster.this.name
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
-  principal_arn = aws_eks_access_entry.terraform_admin_access.principal_arn
+  principal_arn = each.value.principal_arn
 
   access_scope {
     type = "cluster"

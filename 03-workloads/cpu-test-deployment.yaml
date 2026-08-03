@@ -1,26 +1,42 @@
-#apiVersion: apps/v1
-#kind: Deployment
-#metadata:
-#  name: cpu-test-scale
-#  namespace: default
-#spec:
-#  replicas: 3 # Deploy 3 replicas to exceed current cluster capacity
-#  selector:
-#    matchLabels:
-#      app: cpu-test
-#  template:
-#    metadata:
-#      labels:
-#        app: cpu-test
-#    spec:
-#      containers:
-#        - name: pause-container
-#          # Use a lightweight pause image that does nothing but hold resources
-#          image: registry.k8s.io/pause:3.9
-#          resources:
-#            requests:
-#              # Request 800m CPU per pod. Total = 2.4 vCPUs.
-#              # Since system pods already consume CPU on the existing t3.micro nodes,
-#              # this will force Karpenter to launch a new Spot instance.
-#              cpu: 800m
-#              memory: 512Mi
+# ==============================================================================
+# CPU Scale-Out Test
+# ==============================================================================
+# Purpose: force Karpenter to provision a general-purpose Spot node without
+# spending money on a GPU instance. Use this to validate the provisioning path
+# (IAM, subnet discovery, node registration) before testing the GPU pool.
+#
+# The system managed node group is a single t3.small (2 vCPU), most of which is
+# already consumed by kube-system pods. Three pods requesting 800m each cannot
+# fit, so the scheduler marks them Pending and Karpenter reacts by launching a
+# node from the user-gp-pool NodePool.
+#
+#   kubectl apply -f 03-workloads/cpu-test-deployment.yaml
+#   kubectl get nodeclaims -w
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-test-scale
+  namespace: default
+  labels:
+    app: cpu-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cpu-test
+  template:
+    metadata:
+      labels:
+        app: cpu-test
+    spec:
+      containers:
+        - name: pause-container
+          # The pause image holds its resource reservation and does nothing else,
+          # which is exactly what is needed to create scheduling pressure.
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 800m
+              memory: 512Mi
+            limits:
+              memory: 512Mi

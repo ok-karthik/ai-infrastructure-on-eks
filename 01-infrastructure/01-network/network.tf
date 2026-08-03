@@ -1,16 +1,13 @@
 # ==============================================================================
 # AWS Availability Zones & Region Discovery
 # ==============================================================================
-# Why it's needed: Dynamically queries AWS to find all active Availability Zones (AZs)
-# in the current region (e.g. ap-south-2a, ap-south-2b, ap-south-2c).
-# What happens without it: AZs would have to be hardcoded. If an AZ goes down or is
-# not available in a specific region, or if you change regions, the Terraform configuration
-# will fail or be locked to a single region.
+# Why it's needed: Dynamically queries AWS for the active Availability Zones in the
+# region the provider is configured for (e.g. us-east-1a, us-east-1b, us-east-1c).
+# What happens without it: AZs would have to be hardcoded, locking the configuration
+# to one region and breaking if an AZ is unavailable to your account.
 data "aws_availability_zones" "available" {
   state = "available"
 }
-
-data "aws_region" "current" {}
 
 variable "cluster_name" {
   description = "Name of the EKS cluster for resource tagging"
@@ -67,7 +64,11 @@ resource "aws_subnet" "public" {
 
   tags = {
     Name                     = "${local.project}-${local.env}-public-${count.index}"
-    "kubernetes.io/role/elb" = "1" # Required for public ALBs
+    "kubernetes.io/role/elb" = "1" # Marks the subnet as a candidate for internet-facing load balancers
+    # Without the cluster ownership tag, the AWS Load Balancer Controller cannot
+    # associate these subnets with the cluster and internet-facing Ingress creation
+    # fails with "unable to discover at least one subnet".
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
   }
 }
 
@@ -91,7 +92,7 @@ resource "aws_subnet" "private" {
     # EKS specific tags required by EKS to discover subnets for internal load balancers
     "kubernetes.io/role/internal-elb"           = "1"
     "kubernetes.io/cluster/${var.cluster_name}" = "shared"
-    "karpenter.sh/discovery"                    = "${var.cluster_name}"
+    "karpenter.sh/discovery"                    = var.cluster_name
   }
 }
 

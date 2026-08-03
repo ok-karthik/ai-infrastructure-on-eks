@@ -1,25 +1,119 @@
+# ==============================================================================
+# GPU Observability Stack: Prometheus + Grafana
+# ==============================================================================
+# A deliberately small, self-contained stack for scraping DCGM GPU telemetry.
+#
+# This is NOT kube-prometheus-stack. It is a minimal two-pod deployment chosen so
+# the metrics path (DCGM exporter -> Prometheus -> Grafana) stays readable end to
+# end. For production use the Prometheus Operator, which gives you ServiceMonitor
+# CRs, alertmanager, HA, and remote write.
+#
+# Known limitations, stated rather than hidden:
+#   - Storage is emptyDir. All metrics are lost when a pod restarts.
+#   - Single replica each. No HA.
+#   - Both Services are ClusterIP, reachable only via `kubectl port-forward`.
+#     Nothing here is exposed to the internet, which is what makes the dev-only
+#     Grafana credential below acceptable.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# ==============================================================================
+# Prometheus RBAC
+# ==============================================================================
+# Required because the scrape config uses kubernetes_sd_configs. Without these
+# permissions Prometheus starts fine but discovers zero targets and the DCGM job
+# silently stays empty, which looks identical to "the GPU has no metrics".
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/metrics", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: prometheus-config
-  namespace: default
+  namespace: monitoring
 data:
   prometheus.yml: |
     global:
+      # 5s rather than the usual 30s. GPU SM utilization is bursty: an inference
+      # kernel can drive the card from 0% to 100% and back inside a single 30s
+      # window, so a coarse scrape interval reports a mostly-idle GPU that is in
+      # fact saturated. The cost is higher cardinality and storage churn.
       scrape_interval: 5s
       evaluation_interval: 5s
 
     scrape_configs:
-      - job_name: 'dcgm-exporter'
-        static_configs:
-          - targets: ['nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400']
+      # ----------------------------------------------------------------------
+      # DCGM Exporter
+      # ----------------------------------------------------------------------
+      # Discovered per-pod, NOT via the Service DNS name.
+      #
+      # dcgm-exporter is a DaemonSet: one pod per GPU node. Pointing a
+      # static_config at the Service address makes every scrape resolve to the
+      # Service's cluster IP, which load balances to ONE arbitrary backing pod.
+      # With several GPU nodes you would silently collect a random node's metrics
+      # each interval and the resulting graph would be nonsense. Pod-level
+      # discovery scrapes every exporter individually and labels each series with
+      # the node it came from.
+      - job_name: "dcgm-exporter"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["gpu-operator"]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: "nvidia-dcgm-exporter"
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            regex: "9400"
+            action: keep
+          # Attach the node name so metrics can be grouped and joined per GPU host.
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
 
+      # ----------------------------------------------------------------------
+      # Prometheus self-monitoring
+      # ----------------------------------------------------------------------
+      - job_name: "prometheus"
+        static_configs:
+          - targets: ["localhost:9090"]
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: grafana-datasources
-  namespace: default
+  namespace: monitoring
 data:
   datasources.yaml: |
     apiVersion: 1
@@ -27,15 +121,39 @@ data:
       - name: Prometheus
         type: prometheus
         access: proxy
-        url: http://prometheus-service:9090
+        url: http://prometheus-service.monitoring.svc.cluster.local:9090
         isDefault: true
-
+---
+# ==============================================================================
+# Grafana Admin Credential
+# ==============================================================================
+# DEV ONLY. This is a known value committed to a public repository, so treat it
+# as public. It is acceptable here only because grafana-service is ClusterIP and
+# is never exposed outside the cluster; access is via:
+#
+#   kubectl port-forward -n monitoring svc/grafana-service 3000:3000
+#
+# Before exposing Grafana through an Ingress or LoadBalancer, replace it:
+#   kubectl create secret generic grafana-admin -n monitoring \
+#     --from-literal=admin-password="$(openssl rand -base64 24)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-admin
+  namespace: monitoring
+type: Opaque
+stringData:
+  admin-user: admin
+  admin-password: "dev-only-change-me"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: prometheus-deployment
-  namespace: default
+  namespace: monitoring
+  labels:
+    app: prometheus
 spec:
   replicas: 1
   selector:
@@ -46,14 +164,39 @@ spec:
       labels:
         app: prometheus
     spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
       containers:
         - name: prometheus
-          image: prom/prometheus:v2.45.0
+          image: prom/prometheus:v3.7.3
           args:
             - "--config.file=/etc/prometheus/prometheus.yml"
             - "--storage.tsdb.path=/prometheus"
+            # Short retention: this is emptyDir, so a larger window would only
+            # increase the memory footprint of data that is lost on restart.
+            - "--storage.tsdb.retention.time=6h"
           ports:
-            - containerPort: 9090
+            - name: web
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: web
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: web
+            initialDelaySeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
           volumeMounts:
             - name: prometheus-config-volume
               mountPath: /etc/prometheus
@@ -65,27 +208,31 @@ spec:
             name: prometheus-config
         - name: prometheus-storage-volume
           emptyDir: {}
-
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: prometheus-service
-  namespace: default
+  namespace: monitoring
+  labels:
+    app: prometheus
 spec:
+  type: ClusterIP
   selector:
     app: prometheus
   ports:
-    - protocol: TCP
+    - name: web
+      protocol: TCP
       port: 9090
-      targetPort: 9090
-
+      targetPort: web
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: grafana-deployment
-  namespace: default
+  namespace: monitoring
+  labels:
+    app: grafana
 spec:
   replicas: 1
   selector:
@@ -96,14 +243,43 @@ spec:
       labels:
         app: grafana
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        fsGroup: 472
       containers:
         - name: grafana
-          image: grafana/grafana:10.0.0
+          image: grafana/grafana:12.3.1
           ports:
-            - containerPort: 3000
+            - name: http
+              containerPort: 3000
           env:
+            - name: GF_SECURITY_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: admin-user
             - name: GF_SECURITY_ADMIN_PASSWORD
-              value: "admin" # Set default password to admin
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: admin-password
+            # No anonymous access, and no phone-home from a demo cluster.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "false"
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
           volumeMounts:
             - name: grafana-datasources-volume
               mountPath: /etc/grafana/provisioning/datasources
@@ -115,17 +291,22 @@ spec:
             name: grafana-datasources
         - name: grafana-storage-volume
           emptyDir: {}
-
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: grafana-service
-  namespace: default
+  namespace: monitoring
+  labels:
+    app: grafana
 spec:
+  # ClusterIP on purpose. Reach it with:
+  #   kubectl port-forward -n monitoring svc/grafana-service 3000:3000
+  type: ClusterIP
   selector:
     app: grafana
   ports:
-    - protocol: TCP
+    - name: http
+      protocol: TCP
       port: 3000
-      targetPort: 3000
+      targetPort: http
